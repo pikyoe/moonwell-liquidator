@@ -6,6 +6,13 @@ use std::str::FromStr;
 pub struct Config {
     pub base_rpc_http: String,
     pub base_rpc_ws: String,
+    /// Optional: endpoint Base Flashblocks untuk mengirim bundle secara privat
+    /// (menghindari race dengan mempool). Contoh: "https://sepolia-preconf.flashbots.net"
+    pub flashblocks_endpoint: Option<String>,
+    /// Optional: whitelist alamat ChainlinkOEVWrapper yang diperiksa untuk event
+    /// UpdatedPrices. Bila kosong, trigger OEV di-nonaktifkan (selalu false).
+    #[serde(default)]
+    pub oev_wrappers: Vec<String>,
     pub private_key: String,
     pub executor_address: String,
     /// Batas posisi maksimum dalam USD (wei 1e18). Default $25.000.

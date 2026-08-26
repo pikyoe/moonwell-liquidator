@@ -15,6 +15,10 @@ alloy::sol! {
     event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
+    /// Moonwell OEV wrapper — dipancarkan ketika harga wrapper diperbaharui.
+    /// Saat ini berarti "harga on-chain baru ditukwal" dan liquidasi path ada.
+    /// Bot menghasilkan trigger lebih cepat daripada refresh harga 10-block.
+    event UpdatedPrices(uint256 roundId, int256 answer, bool isOEV);
 }
 
 pub struct Indexer<P: Provider> {
@@ -79,5 +83,67 @@ impl<P: Provider + Clone> Indexer<P> {
             },
         );
         Ok(())
+    }
+
+    /// Proses rentang blok — decode **semua** event posisi (dulu hanya Borrow,
+    /// sehingga rentang resync melemparkan 5 event lain). Taxa sekarang digunakan
+    /// minter holdersre antara saat max reconnect WS.
+    pub async fn process_block_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
+        self.watch_block(from_block, to_block).await
+    }
+
+    /// Handler satu blok / rentang blok. Dipanggil per blok di main loop dan juga
+    /// untuk mem-replay rentang yang terlewat saat reconnect WS.
+    pub async fn watch_block(&self, from_block: u64, to_block: u64) -> Result<()> {
+        let filter = Filter::new()
+            .address(self.markets.clone())
+            .from_block(from_block)
+            .to_block(to_block);
+        let logs = self.provider.get_logs(&filter).await?;
+        for log in logs {
+            let market = log.address();
+            let topics = log.topics();
+            if topics.len() >= 3 && topics[0] == Transfer::SIGNATURE_HASH {
+                if let Ok(ev) = Transfer::decode_log(&log.inner) {
+                    // Mint/burn menghasilkan transfer dengan alamat nol — jangan refresh.
+                    if ev.from != Address::ZERO {
+                        let _ = self.refresh_account(market, ev.from).await;
+                    }
+                    if ev.to != Address::ZERO {
+                        let _ = self.refresh_account(market, ev.to).await;
+                    }
+                }
+            } else if let Ok(ev) = Mint::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.minter).await;
+            } else if let Ok(ev) = Redeem::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.redeemer).await;
+            } else if let Ok(ev) = Borrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            } else if let Ok(ev) = RepayBorrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            } else if let Ok(ev) = LiquidateBorrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Periksa UpdatedPrices di wrapper OEV yang dikonfigurasi. Kembali `true`
+    /// bila ada signal ulang scan; lebih baik daripada refresh harga periodik.
+    pub async fn check_price_trigger(
+        &self,
+        block_number: u64,
+        wrapper_addresses: &[Address],
+    ) -> Result<bool> {
+        if wrapper_addresses.is_empty() {
+            return Ok(false);
+        }
+        let filter = Filter::new()
+            .address(wrapper_addresses.to_vec())
+            .event_signature(UpdatedPrices::SIGNATURE_HASH)
+            .from_block(block_number)
+            .to_block(block_number);
+        let logs = self.provider.get_logs(&filter).await?;
+        Ok(!logs.is_empty())
     }
 }

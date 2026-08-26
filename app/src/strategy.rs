@@ -15,6 +15,10 @@ pub struct Strategy<P: Provider> {
     cfg: Config,
     markets: HashMap<Address, MarketInfo>,
     executor: Address,
+    /// Nilai comptroller yang di-cache — di-refresh sekali waktu
+    /// (refresh_prices) agar tidak memanggil RPC di setiap scan.
+    close_factor: U256,
+    liquidation_incentive: U256,
 }
 
 impl<P: Provider + Clone> Strategy<P> {
@@ -25,7 +29,23 @@ impl<P: Provider + Clone> Strategy<P> {
         markets: HashMap<Address, MarketInfo>,
     ) -> Result<Self> {
         let executor = cfg.executor_address()?;
-        Ok(Self { provider, state, cfg, markets, executor })
+        // 0 bila belum di-refresh — evaluate() akan skip sampai ada nilai.
+        Ok(Self {
+            provider,
+            state,
+            cfg,
+            markets,
+            executor,
+            close_factor: U256::ZERO,
+            liquidation_incentive: U256::ZERO,
+        })
+    }
+
+    /// Panggilan satu kali dari refresh_prices: muat close factor &
+    /// liquidation incentive dari comptroller — jangan di-hardcode.
+    pub fn update_comptroller_params(&mut self, close_factor: U256, incentive: U256) {
+        self.close_factor = close_factor;
+        self.liquidation_incentive = incentive;
     }
 
     /// Evaluasi semua borrower; kembalikan job yang lolos simulasi profit.
@@ -86,9 +106,12 @@ impl<P: Provider + Clone> Strategy<P> {
             None => return Ok(None),
         };
 
-        // batasi repay <= close factor * borrow, dan <= max posisi
-        let close_factor = U256::from(5u64 * 10u64.pow(17)); // 0.5e18, dari on-chain
-        let mut repay = borrow_bal * close_factor / U256::from(10u64.pow(18));
+        // batasi repay <= close factor * borrow, dan <= max posisi.
+        // Keluar sampai comptroller params sudah dimuat (hindari repay 0/terlalu besar).
+        if self.close_factor.is_zero() {
+            return Ok(None);
+        }
+        let mut repay = borrow_bal * self.close_factor / U256::from(10u64.pow(18));
         repay = self.cap_by_max_position(mloan, repay).await?;
 
         let loan_info = self.markets.get(&mloan).cloned();
@@ -135,12 +158,15 @@ impl<P: Provider + Clone> Strategy<P> {
             return Ok((Address::ZERO, zero, U256::ZERO));
         }
 
+        // Keluar sampai liquidation incentive sudah dimuat (tak teratur bila 0).
+        if self.liquidation_incentive.is_zero() {
+            return Ok((Address::ZERO, zero.clone(), U256::ZERO));
+        }
+
         let one = U256::from(10u64.pow(18));
         // nilai repay dalam USD (1e18)
         let repay_usd = repay * loan.price / one;
-        // insentif likuidasi 10% (1.1e18), dari comptroller
-        let incentive = U256::from(11u64 * 10u64.pow(17));
-        let seized_usd = repay_usd * incentive / one;
+        let seized_usd = repay_usd * self.liquidation_incentive / one;
         let gross_profit_usd = seized_usd.saturating_sub(repay_usd);
         // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000
         let liquidator_usd = repay_usd

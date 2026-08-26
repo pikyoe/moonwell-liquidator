@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+
 interface IMorpho {
     function flashLoan(address token, uint256 assets, bytes calldata data) external;
 }
 
-interface IERC20 {
-    function balanceOf(address account) external view returns (uint256);
+interface IERC20Symbol {
     function symbol() external view returns (string memory);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
 }
 
 interface IOevWrapper {
@@ -61,6 +61,8 @@ struct LiquidationJob {
 /// Jalur B (Classic): liquidateBorrow standar, siap dipakai sebagai fallback.
 /// Bot off-chain selalu eth_call execute() dulu; revert = transaksi tidak dikirim.
 contract OevLiquidator {
+    using SafeERC20 for IERC20;
+
     IMorpho public constant morpho = IMorpho(0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb);
     IComptroller public constant comptroller = IComptroller(0xfBb21d0380beE3312B33c4353c8936a0F13EF26C);
 
@@ -123,7 +125,7 @@ contract OevLiquidator {
         // Dilewati bila swapTarget == address(0) (mode tanpa swap).
         if (collateralUnderlying != job.loanToken && job.swapTarget != address(0)) {
             uint256 bal = collateralUnderlying.balanceOf(address(this));
-            _approve(address(collateralUnderlying), job.swapTarget, bal);
+            collateralUnderlying.forceApprove(job.swapTarget, bal);
             (bool ok, bytes memory ret) = job.swapTarget.call(job.swapData);
             require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "swap failed");
         }
@@ -136,22 +138,16 @@ contract OevLiquidator {
             job.loanToken.balanceOf(address(this)) >= assets + job.minLoanOut,
             "loan token tidak cukup untuk repay flashloan"
         );
-        _approve(address(job.loanToken), address(morpho), assets);
-    }
-
-    function _approve(address token, address spender, uint256 amount) internal {
-        (bool ok, bytes memory ret) =
-            token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "approve failed");
+        job.loanToken.forceApprove(address(morpho), assets);
     }
 
     function _oevLiquidate(LiquidationJob memory job) internal {
         IERC20 collateralUnderlying = IERC20(job.mTokenCollateral.underlying());
         IOracle oracle = IOracle(comptroller.oracle());
-        address wrapper = oracle.getFeed(collateralUnderlying.symbol());
+        address wrapper = oracle.getFeed(IERC20Symbol(address(collateralUnderlying)).symbol());
         require(wrapper != address(0), "no wrapper");
 
-        _approve(address(job.loanToken), wrapper, job.repayAmount);
+        job.loanToken.forceApprove(wrapper, job.repayAmount);
         IOevWrapper(wrapper).updatePriceEarlyAndLiquidate(
             job.borrower,
             job.repayAmount,
@@ -161,7 +157,7 @@ contract OevLiquidator {
     }
 
     function _classicLiquidate(LiquidationJob memory job) internal {
-        _approve(address(job.loanToken), address(job.mTokenLoan), job.repayAmount);
+        job.loanToken.forceApprove(address(job.mTokenLoan), job.repayAmount);
         require(
             job.mTokenLoan.liquidateBorrow(
                 job.borrower,
@@ -176,12 +172,6 @@ contract OevLiquidator {
     /// kapan pun. Profit disimpan di kontrak antar-eksekusi agar tidak
     /// menambah gas transfer di setiap likuidasi.
     function sweep(address token, uint256 amount) external onlyOwner {
-        _transfer(token, owner, amount);
-    }
-
-    function _transfer(address token, address to, uint256 amount) internal {
-        (bool ok, bytes memory ret) =
-            token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
-        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "transfer failed");
+        IERC20(token).safeTransfer(owner, amount);
     }
 }
