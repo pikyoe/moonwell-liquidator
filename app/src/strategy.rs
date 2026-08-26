@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::contracts::{LiquidationJob, Mode};
+use crate::contracts::{IComptroller, LiquidationJob, Mode, COMPTROLLER};
 use crate::health::{classify, health_factor, Health, MarketInfo};
 use crate::state::SharedState;
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
@@ -106,6 +106,16 @@ impl<P: Provider + Clone> Strategy<P> {
             None => return Ok(None),
         };
 
+        // Pastikan market kolateral benar-benar aktif sebagai collateral bagi
+        // borrower (getAssetsIn). Supply murni tanpa enable-collateral tidak bisa
+        // disita — lewati alih-alih buang RPC di simulasi revert.
+        let comptroller = IComptroller::new(COMPTROLLER, &self.provider);
+        match comptroller.getAssetsIn(borrower).call().await {
+            Ok(assets) if !assets.contains(&mcoll) => return Ok(None),
+            Err(_) => {}
+            Ok(_) => {}
+        }
+
         // batasi repay <= close factor * borrow, dan <= max posisi.
         // Keluar sampai comptroller params sudah dimuat (hindari repay 0/terlalu besar).
         if self.close_factor.is_zero() {
@@ -133,7 +143,7 @@ impl<P: Provider + Clone> Strategy<P> {
             mTokenCollateral: mcoll,
             borrower,
             repayAmount: repay,
-            minProfit: self.cfg.min_profit().unwrap(),
+            minProfit: self.cfg.min_profit()?,
             minLoanOut: min_loan_out,
         };
 
@@ -190,16 +200,17 @@ impl<P: Provider + Clone> Strategy<P> {
             self.cfg.swap.router.parse()?
         };
 
-        let (target, data) = build_aerodrome_swap(
-            coll.underlying,
-            loan.underlying,
+        let (target, data) = build_aerodrome_swap(crate::swap::SwapParams {
+            router,
+            from_token: coll.underlying,
+            to_token: loan.underlying,
             amount_in,
-            min_out,
-            self.executor,
-            is_stable_symbol(loan.symbol.as_str()) && is_stable_symbol(coll.symbol.as_str()),
+            amount_out_min: min_out,
+            recipient: self.executor,
+            stable_pair: is_stable_symbol(loan.symbol.as_str())
+                && is_stable_symbol(coll.symbol.as_str()),
             deadline,
-        )?;
-        debug_assert_eq!(target, router);
+        })?;
 
         // kontrak menuntut balance >= assets + minLoanOut; sisanya jadi profit
         let min_loan_out = min_out.saturating_sub(repay);

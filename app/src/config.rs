@@ -59,13 +59,23 @@ pub struct MarketConfig {
     pub symbol: String,
     pub mtoken: String,
     pub underlying: String,
+    /// Hanya dokumentasi di config (semua harga oracle sudah 1e36-normalized,
+    /// sehingga kalkulasi tidak memakai field ini). Dipertahankan agar
+    /// config.toml existing tetap valid.
+    #[allow(dead_code)]
     pub decimals: u8,
 }
 
 impl Config {
+    /// Baca file dan validasi semua field yang bisa gagal di runtime —
+    /// lebih baik startup gagal cepat dengan pesan jelas daripada panic
+    /// di tengah scan loop.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&raw)?;
+        cfg.min_profit()?;
+        cfg.executor_address()?;
+        cfg.market_addresses()?;
         Ok(cfg)
     }
 
@@ -98,4 +108,35 @@ fn default_max_position() -> u64 {
 }
 fn default_true() -> bool {
     true
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg(min_profit_wei: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+base_rpc_http = "https://x"
+base_rpc_ws = "wss://x"
+private_key = "0x"
+executor_address = "0x0000000000000000000000000000000000000001"
+min_profit_wei = "{min_profit_wei}"
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn min_profit_valid() {
+        let cfg = base_cfg("1000000000000000");
+        assert_eq!(cfg.min_profit().unwrap(), alloy::primitives::U256::from(10u64.pow(15)));
+    }
+
+    #[test]
+    fn min_profit_malformed_error_bukan_panic() {
+        let cfg = base_cfg("bukan-angka");
+        assert!(cfg.min_profit().is_err());
+    }
 }

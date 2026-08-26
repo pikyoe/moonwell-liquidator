@@ -89,14 +89,21 @@ contract OevLiquidator {
     function execute(LiquidationJob calldata job) external onlyOwner {
         require(job.repayAmount > 0, "zero repay");
 
+        // Profit diukur di token hasil akhir: loanToken bila swap aktif,
+        // kolateral underlying bila tidak (termasuk kasus token sama).
         IERC20 collateralUnderlying = IERC20(IMToken(address(job.mTokenCollateral)).underlying());
-        uint256 balBefore = collateralUnderlying.balanceOf(address(this));
+        bool swapExpected = job.swapTarget != address(0) && address(collateralUnderlying) != address(job.loanToken);
+        IERC20 profitToken = swapExpected ? job.loanToken : collateralUnderlying;
+
+        uint256 balBefore = profitToken.balanceOf(address(this));
 
         expectedCallHash = keccak256(abi.encode(job));
         morpho.flashLoan(address(job.loanToken), job.repayAmount, abi.encode(job));
 
-        uint256 profit = collateralUnderlying.balanceOf(address(this)) - balBefore;
+        uint256 profit = profitToken.balanceOf(address(this)) - balBefore;
         expectedCallHash = bytes32(0);
+        // Reset allowance Morpho yang diset di callback.
+        job.loanToken.forceApprove(address(morpho), 0);
         if (profit < job.minProfit) revert NotProfitable(profit, job.minProfit);
     }
 
@@ -124,10 +131,17 @@ contract OevLiquidator {
         // Swap opsional: konversi kolateral -> loanToken supaya flashloan tertutup.
         // Dilewati bila swapTarget == address(0) (mode tanpa swap).
         if (collateralUnderlying != job.loanToken && job.swapTarget != address(0)) {
+            uint256 loanBalBefore = job.loanToken.balanceOf(address(this));
             uint256 bal = collateralUnderlying.balanceOf(address(this));
             collateralUnderlying.forceApprove(job.swapTarget, bal);
-            (bool ok, bytes memory ret) = job.swapTarget.call(job.swapData);
-            require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "swap failed");
+            (bool ok,) = job.swapTarget.call(job.swapData);
+            require(ok, "swap failed");
+            // Verifikasi lewat delta saldo, bukan decode return value.
+            require(
+                job.loanToken.balanceOf(address(this)) > loanBalBefore,
+                "swap tidak mengembalikan apa pun"
+            );
+            collateralUnderlying.forceApprove(job.swapTarget, 0);
         }
 
         // Pengembalian flashloan: Morpho menarik `assets` via transferFrom.
@@ -154,6 +168,8 @@ contract OevLiquidator {
             address(job.mTokenCollateral),
             address(job.mTokenLoan)
         );
+        // Hapus sisa allowance ke wrapper agar tidak ada approval permanen.
+        job.loanToken.forceApprove(wrapper, 0);
     }
 
     function _classicLiquidate(LiquidationJob memory job) internal {
@@ -166,6 +182,7 @@ contract OevLiquidator {
             ) == 0,
             "liquidate failed"
         );
+        job.loanToken.forceApprove(address(job.mTokenLoan), 0);
     }
 
     /// Owner menyedot token apa pun (profit kolateral, atau sisa cadangan)

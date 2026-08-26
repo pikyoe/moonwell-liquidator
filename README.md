@@ -59,7 +59,7 @@ kembalikan flashloan → sisa jadi profit di kontrak.
 
 ```bash
 cd contracts
-BASE_RPC_URL="https://mainnet.base.org" forge test          # 7/7 harus lulus
+BASE_RPC_URL="https://mainnet.base.org" forge test          # 9/9 harus lulus
 forge create --rpc-url "$BASE_RPC_URL" \
   --private-key "$DEPLOYER_KEY" \
   src/OevLiquidator.sol:OevLiquidator
