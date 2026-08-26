@@ -134,6 +134,15 @@ impl<P: Provider + Clone> Strategy<P> {
         let (swap_target, swap_data, min_loan_out) =
             self.build_swap(&loan_info, &coll_info, repay)?;
 
+        // Kontrak mengukur profit di token hasil akhir: loan token bila swap
+        // aktif, kolateral bila tidak. Ambil ambang per simbol agar desimal
+        // (WETH 18 vs USDC 6) tidak membuat ambang salah besar.
+        let output_symbol = if swap_target != Address::ZERO {
+            &loan_info.symbol
+        } else {
+            &coll_info.symbol
+        };
+
         let job = LiquidationJob {
             mode: Mode::Oev,
             loanToken: loan_info.underlying,
@@ -143,7 +152,7 @@ impl<P: Provider + Clone> Strategy<P> {
             mTokenCollateral: mcoll,
             borrower,
             repayAmount: repay,
-            minProfit: self.cfg.min_profit()?,
+            minProfit: self.cfg.min_profit_for_symbol(output_symbol)?,
             minLoanOut: min_loan_out,
         };
 

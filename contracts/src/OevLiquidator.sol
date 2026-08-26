@@ -52,7 +52,10 @@ struct LiquidationJob {
     IMToken mTokenCollateral;
     address borrower;
     uint256 repayAmount;           // sudah dibatasi <= MAX_POSITION di off-chain
-    uint256 minProfit;             // profit minimum collateral token (wei)
+    /// Ambang profit minimum dalam SATUAN AKHIR YANG DIPILIH BOT:
+    /// bila swap aktif → loan token; tanpa swap → kolateral underlying.
+    /// Off-chain wajib mengisi nilai yang sesuai per market (desimal beda-beda).
+    uint256 minProfit;
     uint256 minLoanOut;            // slippage guard swap: loan token minimal yang harus diterima
 }
 
