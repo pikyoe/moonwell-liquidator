@@ -354,4 +354,54 @@ contract OevLiquidatorTest is Test {
         assertEq(executor.expectedCallHash(), bytes32(0), "call hash harus di-clear");
         assertEq(IERC20(USDC).allowance(address(executor), wrapper), 0, "allowance wrapper harus 0");
     }
+
+    /// Pertahanan: bila owner keliru mengisi swapData dengan amountIn lebih
+    /// besar dari saldo kolateral aktual, transaksi harus revert — tidak ada
+    /// dana yang hilang diam-diam.
+    function testSwapAmountInExceedsBalanceReverts() public {
+        address borrower = _createUnderwaterBorrower();
+        LiquidationJob memory job = _buildJob(Mode.Classic, borrower);
+
+        // rusak amountIn di swapData: decode payload (tanpa selector 4B),
+        // gandakan, encode ulang dengan selector yang sama.
+        bytes memory data = job.swapData;
+        bytes4 selector;
+        assembly { selector := mload(add(data, 32)) }
+        bytes memory payload = new bytes(job.swapData.length - 4);
+        for (uint256 i = 0; i < payload.length; i++) {
+            payload[i] = job.swapData[i + 4];
+        }
+        (uint256 amountIn,, Route[] memory routes, address to, uint256 deadline) = abi.decode(
+            payload,
+            (uint256, uint256, Route[], address, uint256)
+        );
+        job.swapData = abi.encodeWithSelector(
+            selector, amountIn * 2, 1, routes, to, deadline
+        );
+
+        vm.expectRevert();
+        executor.execute(job);
+    }
+
+    /// Pertahanan: profit di bawah minProfit harus revert NotProfitable.
+    function testRevertsWhenProfitBelowMin() public {
+        address borrower = _createUnderwaterBorrower();
+        LiquidationJob memory job = _buildJob(Mode.Classic, borrower);
+        job.minProfit = type(uint256).max / 2; // mustahil tercapai
+
+        vm.expectRevert();
+        executor.execute(job);
+    }
+
+    /// Pertahanan: redeem mengirim ETH native untuk market WETH — kontrak
+    /// harus menerima dan membungkusnya kembali (profit terukur di WETH).
+    function testWethRedeemUnwrapsAndWrapsBack() public {
+        address borrower = _createUnderwaterBorrower();
+        LiquidationJob memory job = _buildJob(Mode.Classic, borrower);
+
+        // ETH kontrak harus 0 sebelum & sesudah (semua di-wrap ke WETH)
+        assertEq(address(executor).balance, 0, "ETH harus 0 sebelum");
+        executor.execute(job);
+        assertEq(address(executor).balance, 0, "ETH harus 0 sesudah (semua di-wrap)");
+    }
 }

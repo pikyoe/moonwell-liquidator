@@ -105,6 +105,10 @@ impl<P: Provider + Clone> Strategy<P> {
             Some(x) => x,
             None => return Ok(None),
         };
+        // Lepaskan read guard pada map positions SEBELUM upsert() — upsert
+        // mengambil write lock pada shard yang sama; menahannya di sini akan
+        // deadlock tepat saat kandidat likuidasi ditemukan.
+        drop(positions);
 
         // Refresh posisi kandidat di kedua market — snapshot state bisa basi
         // (bunga terakru, likuidasi lain). Bangun job dari data segar.

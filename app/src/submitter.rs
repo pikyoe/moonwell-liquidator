@@ -95,7 +95,15 @@ impl Submitter {
         //    batas — profit on-chain tidak menghitung ETH yang keluar untuk gas.
         match contract.execute(job.clone()).estimate_gas().await {
             Ok(gas) => {
-                let gas_price = self.provider.get_gas_price().await.unwrap_or(0);
+                // Gas price gagal dibaca -> batalkan. unwrap_or(0) akan
+                // meloloskan guard tepat saat harga gas tidak diketahui.
+                let gas_price = match self.provider.get_gas_price().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(?e, "gagal baca gas price — job dibatalkan");
+                        return Ok(());
+                    }
+                };
                 let cost = U256::from(gas) * U256::from(gas_price);
                 if cost > self.max_gas_cost {
                     warn!(gas, gas_price, %cost, "estimasi gas melebihi batas — job dibatalkan");
