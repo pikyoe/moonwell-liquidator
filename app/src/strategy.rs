@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::contracts::{IOevLiquidator, LiquidationJob, Mode};
+use crate::contracts::{LiquidationJob, Mode};
 use crate::health::{classify, health_factor, Health, MarketInfo};
 use crate::state::SharedState;
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
@@ -110,7 +110,7 @@ impl<P: Provider + Clone> Strategy<P> {
             mTokenCollateral: mcoll,
             borrower,
             repayAmount: repay,
-            minProfit: self.cfg.min_profit_wei.parse().unwrap_or_default(),
+            minProfit: self.cfg.min_profit().unwrap(),
             minLoanOut: min_loan_out,
         };
 

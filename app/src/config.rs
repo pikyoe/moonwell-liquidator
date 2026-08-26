@@ -67,6 +67,17 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("executor_address tidak valid: {e}"))
     }
 
+    /// min_profit harus di-parse dengan benar. Argument ini ada di LiquidationJob;
+    /// nilai 0 = terima untung nol tanpa sadar.
+    pub fn min_profit(&self) -> anyhow::Result<alloy::primitives::U256> {
+        self.min_profit_wei
+            .parse()
+            .map_err(|_| anyhow::anyhow!(
+                "min_profit_wei tidak bisa di-parse: {}",
+                self.min_profit_wei
+            ))
+    }
+
     pub fn market_addresses(&self) -> anyhow::Result<Vec<Address>> {
         self.markets
             .iter()

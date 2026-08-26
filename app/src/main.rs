@@ -19,8 +19,9 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use std::str::FromStr;
+use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -62,46 +63,85 @@ async fn main() -> Result<()> {
         warn!(?e, "bootstrap gagal — lanjut dengan state kosong");
     }
 
-    let mut strategy = Strategy::new(http.clone(), state.clone(), cfg.clone(), markets)?;
-    let submitter = Submitter::new(cfg.base_rpc_http.parse()?, signer, executor).await?;
+    let strategy = Arc::new(tokio::sync::Mutex::new(
+        Strategy::new(http.clone(), state.clone(), cfg.clone(), markets)?,
+    ));
+    let submitter = Arc::new(Submitter::new(cfg.base_rpc_http.parse()?, signer, executor).await?);
 
-    let mut block_stream = ws.subscribe_blocks().await?.into_stream();
     info!("bot berjalan — memantau blok baru");
 
-    while let Some(block) = block_stream.next().await {
-        let number = block.number;
-        info!(number, "blok baru");
-
-        if number % 10 == 0 {
-            if let Err(e) = refresh_prices(&http, &cfg, &mut strategy).await {
-                warn!(?e, "refresh harga gagal");
+    // Reconnect WS tanpa batas dengan backoff ringan.
+    'outer: loop {
+        let stream_result = ws.subscribe_blocks().await;
+        let mut stream = match stream_result {
+            Ok(s) => s.into_stream(),
+            Err(e) => {
+                warn!(?e, "gagal connect WS, coba ulang dalam 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue 'outer;
             }
-        }
+        };
 
-        match strategy.scan_opportunities().await {
-            Ok(jobs) => {
-                for job in jobs {
-                    if let Err(e) = submitter.simulate_and_send(job.clone()).await {
-                        warn!(?e, "kirim jalur A gagal");
-                        if cfg.classic_fallback {
-                            let mut jb = job;
-                            jb.mode = Mode::Classic;
-                            if let Err(e2) = submitter.simulate_and_send(jb).await {
-                                warn!(?e2, "kirim jalur B gagal");
-                            }
-                        }
-                    }
+        // Submitter non-blocking: enqueue di sini, join di akhir.
+        let mut tasks = tokio::task::JoinSet::new();
+
+        while let Some(block) = stream.next().await {
+            let number = block.number;
+            info!(number, "blok baru");
+
+            if number % 10 == 0 {
+                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+                    warn!(?e, "refresh harga gagal");
                 }
             }
-            Err(e) => warn!(?e, "scan gagal"),
+
+            // clone config untuk digunakan dalam task
+            let cfg = cfg.clone();
+            let strategy = strategy.clone();
+            let submitter = submitter.clone();
+
+            match strategy.lock().await.scan_opportunities().await {
+                Ok(jobs) => {
+                    for job in jobs {
+                        let submitter = submitter.clone();
+                        let cfg = cfg.clone();
+                        tasks.spawn(async move {
+                            if let Err(e) = submitter.simulate_and_send(job.clone()).await {
+                                warn!(?e, "kirim jalur A gagal");
+                                if cfg.classic_fallback {
+                                    let mut jb = job;
+                                    jb.mode = Mode::Classic;
+                                    if let Err(e2) = submitter.simulate_and_send(jb).await {
+                                        warn!(?e2, "kirim jalur B gagal");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(e) => warn!(?e, "scan gagal"),
+            }
+
+            // prune borrowers yang sudah tidak punya posisi; workaround sederhana
+            // dengan melakukannya tiap 100 blok (sejalan snapshot).
+            if number % 100 == 0 {
+                if let Err(e) = state.save_snapshot(snapshot_path, number) {
+                    warn!(?e, "snapshot gagal");
+                }
+                state.prune_inactive_borrowers();
+            }
         }
 
-        if number % 100 == 0 {
-            let _ = state.save_snapshot(snapshot_path, number);
+        warn!("stream putus — reconnect");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // tunggu task submitter sebelum reconnect untuk menghindari leak
+        while let Some(res) = tasks.join_next().await {
+            if let Err(e) = res {
+                warn!(?e, "submitter task panic");
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn build_market_map<P: Provider>(
@@ -137,15 +177,16 @@ async fn build_market_map<P: Provider>(
 async fn refresh_prices<P: Provider + Clone>(
     provider: &P,
     cfg: &Config,
-    strategy: &mut Strategy<P>,
+    strategy: Arc<Mutex<Strategy<P>>>,
 ) -> Result<()> {
     let comptroller = IComptroller::new(COMPTROLLER, provider);
     let oracle_addr = comptroller.oracle().call().await?;
     let oracle = IOracle::new(oracle_addr, provider);
+    let mut s = strategy.lock().await;
     for m in &cfg.markets {
         let mtoken = Address::from_str(&m.mtoken)?;
         if let Ok(p) = oracle.getUnderlyingPrice(mtoken).call().await {
-            strategy.update_price(mtoken, p);
+            s.update_price(mtoken, p);
         }
     }
     Ok(())

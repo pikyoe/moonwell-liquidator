@@ -44,6 +44,35 @@ impl AccountState {
 
     /// Snapshot ringan ke disk untuk mempercepat restart.
     /// Bukan source of truth — selalu di-resync dari chain setelah load.
+    /// Buang borrower yang tidak lagi punya posisi borrow maupun supply.
+    /// Menjaga daftar borrowers tidak tumbuh tanpa batas.
+    pub fn prune_inactive_borrowers(&self) {
+        let total = self.borrowers.len();
+        // Hapus jika tidak ada posisi aktif di mana pun.
+        let inactive: Vec<Address> = self
+            .borrowers
+            .iter()
+            .filter(|acct| {
+                self.positions
+                    .get(acct.key())
+                    .map(|p| {
+                        p.iter().all(|pos| {
+                            pos.borrow_balance == U256::ZERO && pos.mtoken_balance == U256::ZERO
+                        })
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|e| *e.key())
+            .collect();
+        for acct in inactive {
+            self.borrowers.remove(&acct);
+        }
+        let removed = total - self.borrowers.len();
+        if removed > 0 {
+            tracing::debug!(removed, "borrower inaktif dihapus");
+        }
+    }
+
     pub fn save_snapshot(&self, path: &str, last_block: u64) -> std::io::Result<()> {
         let mut pos: HashMap<String, HashMap<String, PositionSerde>> = HashMap::new();
         for acct in self.positions.iter() {

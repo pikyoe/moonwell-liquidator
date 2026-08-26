@@ -66,6 +66,13 @@ contract OevLiquidator {
 
     address public immutable owner;
 
+    /// Hash job yang sah untuk callback flashloan berikutnya.
+    /// Hanya execute() (onlyOwner) yang boleh mengaturnya. Callback hanya
+    /// jalan bila ID cocok; di-clear setelahnya. Tanpa ini, siapa pun bisa
+    /// memanggil morpho.flashLoan dengan kontrak ini sebagai penerima dan
+    /// mencuri reserve via swapTarget/swapData arbitrer.
+    bytes32 public expectedCallHash;
+
     error NotProfitable(uint256 profit, uint256 minProfit);
 
     constructor() {
@@ -83,15 +90,22 @@ contract OevLiquidator {
         IERC20 collateralUnderlying = IERC20(IMToken(address(job.mTokenCollateral)).underlying());
         uint256 balBefore = collateralUnderlying.balanceOf(address(this));
 
+        expectedCallHash = keccak256(abi.encode(job));
         morpho.flashLoan(address(job.loanToken), job.repayAmount, abi.encode(job));
 
         uint256 profit = collateralUnderlying.balanceOf(address(this)) - balBefore;
+        expectedCallHash = bytes32(0);
         if (profit < job.minProfit) revert NotProfitable(profit, job.minProfit);
     }
 
     function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
         require(msg.sender == address(morpho), "bad caller");
         LiquidationJob memory job = abi.decode(data, (LiquidationJob));
+
+        // Hanya terima callback untuk flashloan yang dipicu execute().
+        // Hash tidak di-clear di sini — kalau callback revert, flag di execute()
+        // juga revert sehingga tidak sisa stuck. Clear di execute() setelah selesai.
+        require(expectedCallHash == keccak256(abi.encode(job)), "unknown flashloan");
 
         if (job.mode == Mode.Oev) {
             _oevLiquidate(job);

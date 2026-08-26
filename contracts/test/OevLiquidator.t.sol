@@ -134,6 +134,7 @@ contract OevLiquidatorTest is Test {
         Route[] memory routes = new Route[](1);
         routes[0] = Route({from: USDC, to: WETH, stable: false, factory: AERODROME_FACTORY});
 
+        // executor (owner) harus approve router -> calldata berjalan
         vm.prank(address(executor));
         (bool ok,) = USDC.call(
             abi.encodeWithSelector(IERC20.approve.selector, AERODROME_ROUTER, amountIn)
@@ -143,7 +144,7 @@ contract OevLiquidatorTest is Test {
         bytes memory swapData = abi.encodeWithSelector(
             bytes4(keccak256("swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)")),
             amountIn,
-            1, // amountOutMin minimal — hanya membuktikan calldata valid
+            1,
             routes,
             address(executor),
             block.timestamp + 600
@@ -152,7 +153,45 @@ contract OevLiquidatorTest is Test {
         uint256 wethBefore = IERC20(WETH).balanceOf(address(executor));
         vm.prank(address(executor));
         (bool swapOk,) = AERODROME_ROUTER.call(swapData);
-        require(swapOk, "swap revert: cek alamat router atau factory");
+        require(swapOk, "swap revert: cek alamat router/factory");
         assertGt(IERC20(WETH).balanceOf(address(executor)), wethBefore, "WETH harus bertambah");
     }
+
+    /// Temuan audit #1: siapa pun dapat mencuri reserve via callback
+    /// tanpa flag yang menandai flashloan diforecksikan execute().
+    function testCallbackRejectsForgedFlashloan() public {
+        LiquidationJob memory job;
+        job.mode = Mode.Oev;
+        job.loanToken = IERC20(WETH);
+        job.swapTarget = address(0);
+        job.swapData = "";
+        job.mTokenLoan = IMToken(M_WETH);
+        job.mTokenCollateral = IMToken(M_WETH);
+        job.borrower = address(0x1234);
+        job.repayAmount = 1;
+        job.minProfit = 0;
+        job.minLoanOut = 0;
+
+        // langsung panggil callback dari morpho — harus revert karena flag tidak diset
+        vm.prank(MORPHO);
+        vm.expectRevert("unknown flashloan");
+        executor.onMorphoFlashLoan(1, abi.encode(job));
+        assertEq(executor.expectedCallHash(), bytes32(0));
+    }
+
+    /// Flag diset hanya oleh execute() (onlyOwner), jadi forged call dari
+    /// attacker tidak bisa memalsukan.
+    function testOnlyMorphoCanCallCallback() public {
+        // attacker memanggil onMorphoFlashLoan; revert karena bukan morpho
+        LiquidationJob memory job;
+        job.mode = Mode.Oev;
+        job.loanToken = IERC20(WETH);
+        job.mTokenLoan = IMToken(M_WETH);
+        job.mTokenCollateral = IMToken(M_WETH);
+        job.repayAmount = 1;
+
+        vm.expectRevert("bad caller");
+        executor.onMorphoFlashLoan(1, abi.encode(job));
+    }
 }
+
