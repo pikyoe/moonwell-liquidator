@@ -8,6 +8,12 @@ pub struct MarketInfo {
     pub symbol: String,
     pub collateral_factor: U256, // 1e18
     pub price: U256,             // 1e(36-decimals)
+    /// Bagian sitaan yang diambil protokol (1e18). Liquidator hanya menerima
+    /// (1 - share) dari perhitungan sitaan bruto — wajib dikurangkan saat
+    /// mengestimasi amount_in swap, jika tidak swap revert kekurangan saldo.
+    pub protocol_seize_share: U256,
+    /// Fee liquidator OEV (bps) dibaca on-chain dari wrapper; None = pakai config.
+    pub oev_fee_bps: Option<u64>,
 }
 
 impl MarketInfo {
@@ -80,6 +86,8 @@ mod tests {
             symbol: "X".into(),
             collateral_factor: cf,
             price,
+            protocol_seize_share: U256::ZERO,
+            oev_fee_bps: None,
         }
     }
 

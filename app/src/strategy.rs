@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::contracts::{IComptroller, LiquidationJob, Mode, COMPTROLLER};
+use crate::contracts::{IComptroller, IMToken, LiquidationJob, Mode, COMPTROLLER};
 use crate::health::{classify, health_factor, Health, MarketInfo};
 use crate::state::SharedState;
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
@@ -97,7 +97,7 @@ impl<P: Provider + Clone> Strategy<P> {
             }
         }
 
-        let (mloan, borrow_bal) = match best_loan {
+        let (mloan, _stale_borrow) = match best_loan {
             Some(x) => x,
             None => return Ok(None),
         };
@@ -105,6 +105,43 @@ impl<P: Provider + Clone> Strategy<P> {
             Some(x) => x,
             None => return Ok(None),
         };
+        // Lepaskan read guard pada map positions SEBELUM upsert() — upsert
+        // mengambil write lock pada shard yang sama; menahannya di sini akan
+        // deadlock tepat saat kandidat likuidasi ditemukan.
+        drop(positions);
+
+        // Refresh posisi kandidat di kedua market — snapshot state bisa basi
+        // (bunga terakru, likuidasi lain). Bangun job dari data segar.
+        for market in [mloan, mcoll] {
+            let snap = IMToken::new(market, &self.provider)
+                .getAccountSnapshot(borrower)
+                .call()
+                .await;
+            match snap {
+                Ok(s) => self.state.upsert(
+                    borrower,
+                    market,
+                    crate::state::Position {
+                        mtoken_balance: s.mTokenBalance,
+                        borrow_balance: s.borrowBalance,
+                        exchange_rate: s.exchangeRateMantissa,
+                    },
+                ),
+                Err(e) => {
+                    warn!(?borrower, ?market, ?e, "refresh kandidat gagal — skip");
+                    return Ok(None);
+                }
+            }
+        }
+        let (borrow_bal, coll_bal) = {
+            let Some(pos) = self.state.positions.get(&borrower) else { return Ok(None) };
+            let borrow = pos.get(&mloan).map(|p| p.borrow_balance).unwrap_or(U256::ZERO);
+            let coll = pos.get(&mcoll).map(|p| p.mtoken_balance).unwrap_or(U256::ZERO);
+            (borrow, coll)
+        };
+        if borrow_bal.is_zero() || coll_bal.is_zero() {
+            return Ok(None); // posisi sudah berubah sejak scan
+        }
 
         // Pastikan market kolateral benar-benar aktif sebagai collateral bagi
         // borrower (getAssetsIn). Supply murni tanpa enable-collateral tidak bisa
@@ -185,11 +222,16 @@ impl<P: Provider + Clone> Strategy<P> {
         let one = U256::from(10u64.pow(18));
         // nilai repay dalam USD (1e18)
         let repay_usd = repay * loan.price / one;
-        let seized_usd = repay_usd * self.liquidation_incentive / one;
+        // Sitaan bruto dikurangi bagian protokol (protocolSeizeShareMantissa) —
+        // estimasi tanpa koreksi ini membuat amount_in melebihi saldo aktual.
+        let seized_usd = repay_usd * self.liquidation_incentive / one
+            * (one - coll.protocol_seize_share) / one;
         let gross_profit_usd = seized_usd.saturating_sub(repay_usd);
-        // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000
+        // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000.
+        // Fee dibaca on-chain per market bila tersedia; config hanya fallback.
+        let fee_bps = coll.oev_fee_bps.unwrap_or(self.cfg.swap.liquidator_fee_bps);
         let liquidator_usd = repay_usd
-            + gross_profit_usd * U256::from(self.cfg.swap.liquidator_fee_bps) / U256::from(10_000u64);
+            + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64);
 
         // konversi ke unit underlying kolateral & estimasi hasil dalam loanToken
         let amount_in = liquidator_usd * one / coll.price;

@@ -30,6 +30,11 @@ pub struct Config {
     /// Simbol yang tidak tercantum akan pakai `min_profit_wei`.
     #[serde(default)]
     pub min_profit_per_symbol: std::collections::HashMap<String, String>,
+    /// Batas biaya gas per transaksi (wei ETH). Transaksi yang estimasi
+    /// gas-nya melebihi ini di-skip — mencegah minProfit yang salah set
+    /// menguras ETH untuk gas. Default 0.0005 ETH.
+    #[serde(default = "default_max_gas_cost")]
+    pub max_gas_cost_wei: String,
     /// Aktifkan jalur B (classic) sebagai fallback.
     #[serde(default = "default_true")]
     pub classic_fallback: bool,
@@ -84,9 +89,17 @@ impl Config {
         let cfg: Config = toml::from_str(&raw)?;
         cfg.min_profit()?;
         cfg.validate_min_profit_map()?;
+        cfg.max_gas_cost()?;
         cfg.executor_address()?;
         cfg.market_addresses()?;
         Ok(cfg)
+    }
+
+    /// Batas biaya gas dalam wei. Divalidasi saat startup.
+    pub fn max_gas_cost(&self) -> anyhow::Result<alloy::primitives::U256> {
+        self.max_gas_cost_wei
+            .parse()
+            .map_err(|_| anyhow::anyhow!("max_gas_cost_wei tidak bisa di-parse: {}", self.max_gas_cost_wei))
     }
 
     pub fn executor_address(&self) -> anyhow::Result<Address> {
@@ -139,6 +152,9 @@ impl Config {
 fn default_max_position() -> u64 {
     25_000
 }
+fn default_max_gas_cost() -> String {
+    "500000000000000".into() // 0.0005 ETH
+}
 fn default_true() -> bool {
     true
 }
@@ -187,6 +203,15 @@ min_profit_wei = "{min_profit_wei}"
             cfg.min_profit_for_symbol("WETH").unwrap(),
             alloy::primitives::U256::from(1_000u64)
         );
+    }
+
+    #[test]
+    fn max_gas_cost_default_dan_parse() {
+        let cfg = base_cfg("1000");
+        assert_eq!(cfg.max_gas_cost().unwrap(), alloy::primitives::U256::from(500_000_000_000_000u64));
+        let mut cfg2 = base_cfg("1000");
+        cfg2.max_gas_cost_wei = "bukan-angka".into();
+        assert!(cfg2.max_gas_cost().is_err());
     }
 
     #[test]

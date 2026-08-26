@@ -8,7 +8,7 @@ mod submitter;
 mod swap;
 
 use crate::config::Config;
-use crate::contracts::{IComptroller, IOevLiquidator, IOracle, Mode, COMPTROLLER};
+use crate::contracts::{IChainlinkOEVWrapper, IComptroller, IMToken, IOevLiquidator, IOracle, Mode, COMPTROLLER};
 use crate::health::MarketInfo;
 use crate::indexer::Indexer;
 use crate::state::{AccountState, SharedState};
@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
             signer,
             executor,
             cfg.flashblocks_endpoint.as_ref().map(|u| u.parse()).transpose()?,
+            cfg.max_gas_cost()?,
         )
         .await?,
     );
@@ -149,7 +150,12 @@ async fn main() -> Result<()> {
             // Trigger wrapper OEV — scan langsung tanpa perlu menunggu refresh 10-blok.
             if !oev_wrappers.is_empty() {
                 match indexer.check_price_trigger(number, &oev_wrappers).await {
-                    Ok(true) => spawn_scan(strategy.clone(), submitter.clone(), cfg.clone()).await,
+                    Ok(true) => {
+                        if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+                            warn!(?e, "refresh harga saat trigger OEV gagal");
+                        }
+                        spawn_scan(strategy.clone(), submitter.clone(), cfg.clone()).await
+                    }
                     Ok(false) => {}
                     Err(e) => warn!(?e, "cek trigger OEV gagal"),
                 }
@@ -225,6 +231,26 @@ async fn build_market_map<P: Provider>(
         let cf = comptroller.markets(mtoken).call().await;
         let collateral_factor = cf.map(|r| r.collateralFactorMantissa).unwrap_or_default();
         let price = oracle.getUnderlyingPrice(mtoken).call().await.unwrap_or_default();
+        let seize_share = IMToken::new(mtoken, provider)
+            .protocolSeizeShareMantissa()
+            .call()
+            .await
+            .ok()
+            .unwrap_or_default();
+        // Fee liquidator OEV dari wrapper yang terdaftar di oracle (bila ada).
+        // Config liquidator_fee_bps hanya dipakai sebagai fallback.
+        let oev_fee_bps = match oracle.getFeed(m.symbol.clone()).call().await {
+            Ok(feed) if feed != Address::ZERO => {
+                match IChainlinkOEVWrapper::new(feed, provider).liquidatorFeeBps().call().await {
+                    Ok(fee) => Some(fee as u64),
+                    Err(e) => {
+                        warn!(?e, symbol = m.symbol, "gagal baca liquidatorFeeBps — pakai config");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         map.insert(
             mtoken,
             MarketInfo {
@@ -232,6 +258,8 @@ async fn build_market_map<P: Provider>(
                 symbol: m.symbol.clone(),
                 collateral_factor,
                 price,
+                protocol_seize_share: seize_share,
+                oev_fee_bps,
             },
         );
     }

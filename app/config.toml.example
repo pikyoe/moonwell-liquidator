@@ -13,7 +13,14 @@ executor_address = "0x..."
 max_position_usd = 25000
 # minimum profit dalam wei TOKEN HASIL AKHIR (loan token bila swap aktif,
 # kolateral bila tidak). Fallback bila simbol tidak ada di map di bawah.
+# PERINGATAN: "0" berarti bot mengirim likuidasi berprofit nol — isi nilai
+# masuk akal, idealnya via [min_profit_per_symbol].
 min_profit_wei = "0"
+
+# batas biaya gas per transaksi dalam wei ETH (default 0.0005 ETH).
+# Tx dengan estimasi gas cost di atas ini di-skip — melindungi dari
+# min_profit salah konfigurasi atau gas spike.
+max_gas_cost_wei = "500000000000000"
 # Override per simbol — penting karena desimal beda (WETH 18, USDC 6, cbBTC 8).
 # [min_profit_per_symbol]
 # WETH = "1000000000000000"   # 0.001 ETH
