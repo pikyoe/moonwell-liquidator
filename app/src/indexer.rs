@@ -15,6 +15,10 @@ alloy::sol! {
     event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
+    /// Moonwell OEV wrapper — dipancarkan ketika harga wrapper diperbaharui.
+    /// Saat ini berarti "harga on-chain baru ditukwal" dan liquidasi path ada.
+    /// Bot menghasilkan trigger lebih cepat daripada refresh harga 10-block.
+    event UpdatedPrices(uint256 roundId, int256 answer, bool isOEV);
 }
 
 pub struct Indexer<P: Provider> {
@@ -127,5 +131,22 @@ impl<P: Provider + Clone> Indexer<P> {
             }
         }
         Ok(())
+    }
+
+    /// Periksa log hanya untuk UpdatedPrices — signal trigger ulang scan. Hasilnya
+    /// biasanya kosong karena wrapper OEV jarang menerbit log di setiap blok; helper
+    /// dipanggil oleh main loop untuk memutuskan apakah scan dilakukan tilt singleton.
+    pub async fn check_price_trigger(&self, block_number: u64) -> Result<bool> {
+        let wrapper_addresses = Vec::new(); // tidak aktif tanpa whitelist wrapper terare
+        if wrapper_addresses.is_empty() {
+            return Ok(false);
+        }
+        let filter = Filter::new()
+            .address(wrapper_addresses)
+            .event_signature(UpdatedPrices::SIGNATURE_HASH)
+            .from_block(block_number)
+            .to_block(block_number);
+        let logs = self.provider.get_logs(&filter).await?;
+        Ok(!logs.is_empty())
     }
 }

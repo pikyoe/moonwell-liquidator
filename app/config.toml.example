@@ -1,5 +1,7 @@
 base_rpc_http = "https://mainnet.base.org"
 base_rpc_ws   = "wss://YOUR_RPC_WS"
+# opsional: endpoint flashblocks Base untuk submit bundle private (hindari race mempublis)
+# flashblocks_endpoint = "https://sepolia-preconf.flashbots.net"
 private_key   = "0x..."
 executor_address = "0x..."
 

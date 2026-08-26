@@ -71,7 +71,15 @@ async fn main() -> Result<()> {
     if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
         warn!(?e, "refresh harga awal gagal — params akan 0 sampai refresh berikutnya");
     }
-    let submitter = Arc::new(Submitter::new(cfg.base_rpc_http.parse()?, signer, executor).await?);
+    let submitter = Arc::new(
+        Submitter::new(
+            cfg.base_rpc_http.parse()?,
+            signer,
+            executor,
+            cfg.flashblocks_endpoint.as_ref().map(|u| u.parse()).transpose()?,
+        )
+        .await?,
+    );
 
     info!("bot berjalan — memantau blok baru");
 
