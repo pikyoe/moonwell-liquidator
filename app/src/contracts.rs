@@ -15,13 +15,14 @@ sol! {
         function borrowIndex() external view returns (uint256);
         function accrueInterest() external returns (uint256);
         function getAccountSnapshot(address account) external view returns (uint256 err, uint256 mTokenBalance, uint256 borrowBalance, uint256 exchangeRateMantissa);
+        function protocolSeizeShareMantissa() external view returns (uint256);
     }
 
     #[sol(rpc)]
     interface IComptroller {
         function getAccountLiquidity(address account) external view returns (uint256 err, uint256 liquidity, uint256 shortfall);
         function getAssetsIn(address account) external view returns (address[]);
-        function markets(address mToken) external view returns (bool isListed, uint256 collateralFactorMantissa, bool isComped);
+        function markets(address mToken) external view returns (bool isListed, uint256 collateralFactorMantissa);
         function closeFactorMantissa() external view returns (uint256);
         function liquidationIncentiveMantissa() external view returns (uint256);
         function oracle() external view returns (address);

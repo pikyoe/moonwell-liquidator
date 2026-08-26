@@ -9,12 +9,58 @@ interface IComptrollerFull is IComptroller {
         external
         view
         returns (uint256 err, uint256 liquidity, uint256 shortfall);
-    function markets(address mToken) external view returns (bool isListed, uint256 collateralFactorMantissa, bool isComped);
+    function markets(address mToken) external view returns (bool isListed, uint256 collateralFactorMantissa);
     function getAssetsIn(address account) external view returns (address[] memory);
 }
 
 interface IERC20Full is IERC20 {
     function decimals() external view returns (uint8);
+}
+
+interface IMTokenFull is IMToken {
+    function mint(uint256 mintAmount) external returns (uint256);
+    function borrow(uint256 borrowAmount) external returns (uint256);
+    function borrowBalanceStored(address account) external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function protocolSeizeShareMantissa() external view returns (uint256);
+}
+
+interface IComptrollerActions is IComptrollerFull {
+    function enterMarkets(address[] calldata mTokens) external returns (uint256[] memory);
+    function liquidateCalculateSeizeTokens(address mTokenBorrowed, address mTokenCollateral, uint256 actualRepayAmount)
+        external
+        view
+        returns (uint256 err, uint256 seizeTokens);
+}
+
+interface IPriceOracle {
+    function getUnderlyingPrice(address mToken) external view returns (uint256);
+}
+
+interface IWETH {
+    function deposit() external payable;
+}
+
+/// Wrapper OEV palsu untuk fork test: meniru perilaku ChainlinkOEVWrapper
+/// (tarik repay dari liquidator, liquidateBorrow, teruskan sitaan) tanpa
+/// mekanisme auction. Di-etch ke alamat wrapper asli.
+contract FakeOevWrapper {
+    function updatePriceEarlyAndLiquidate(
+        address borrower,
+        uint256 repayAmount,
+        address mTokenCollateral,
+        address mTokenLoan
+    ) external {
+        IERC20 loan = IERC20(IMToken(mTokenLoan).underlying());
+        loan.transferFrom(msg.sender, address(this), repayAmount);
+        loan.approve(mTokenLoan, repayAmount);
+        require(
+            IMToken(mTokenLoan).liquidateBorrow(borrower, repayAmount, mTokenCollateral) == 0,
+            "fake wrapper: liquidate gagal"
+        );
+        uint256 seized = IMToken(mTokenCollateral).balanceOf(address(this));
+        IERC20(address(mTokenCollateral)).transfer(msg.sender, seized);
+    }
 }
 
 contract OevLiquidatorTest is Test {
@@ -193,5 +239,119 @@ contract OevLiquidatorTest is Test {
         vm.expectRevert("bad caller");
         executor.onMorphoFlashLoan(1, abi.encode(job));
     }
-}
 
+    // --- end-to-end happy path (fork Base) ---
+
+    address constant M_USDC = 0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22;
+
+    /// Buat borrower nyata di fork: deposit 10 WETH, borrow 65% dari batas,
+    /// lalu mock harga WETH jatuh 40% sehingga masuk shortfall.
+    function _createUnderwaterBorrower() internal returns (address borrower) {
+        borrower = makeAddr("borrower");
+        IPriceOracle oracle = IPriceOracle(ORACLE);
+        uint256 wethPrice = oracle.getUnderlyingPrice(M_WETH);
+        (, uint256 cf) = IComptrollerFull(COMPTROLLER).markets(M_WETH);
+
+        vm.deal(borrower, 10 ether);
+        vm.startPrank(borrower);
+        IWETH(WETH).deposit{value: 10 ether}();
+        IERC20(WETH).approve(M_WETH, type(uint256).max);
+        require(IMTokenFull(M_WETH).mint(10 ether) == 0, "mint gagal");
+        address[] memory mkts = new address[](1);
+        mkts[0] = M_WETH;
+        IComptrollerActions(COMPTROLLER).enterMarkets(mkts);
+        uint256 maxBorrowUsd = (10 ether * wethPrice / 1e18) * cf / 1e18;
+        uint256 borrowUsd = maxBorrowUsd * 65 / 100;
+        uint256 usdcPrice = oracle.getUnderlyingPrice(M_USDC);
+        uint256 borrowAmt = borrowUsd * 1e18 / usdcPrice;
+        require(IMTokenFull(M_USDC).borrow(borrowAmt) == 0, "borrow gagal");
+        vm.stopPrank();
+
+        vm.mockCall(
+            ORACLE,
+            abi.encodeWithSelector(IPriceOracle.getUnderlyingPrice.selector, M_WETH),
+            abi.encode(wethPrice * 60 / 100)
+        );
+        (,, uint256 shortfall) = IComptrollerFull(COMPTROLLER).getAccountLiquidity(borrower);
+        assertGt(shortfall, 0, "borrower harus underwater");
+    }
+
+    /// Bangun job realistis: repay = close factor, swap WETH -> USDC via
+    /// Aerodrome dengan amountIn 99% dari estimasi sitaan (buffer pembulatan).
+    function _buildJob(Mode mode, address borrower) internal view returns (LiquidationJob memory) {
+        uint256 borrowBal = IMTokenFull(M_USDC).borrowBalanceStored(borrower);
+        uint256 repay = borrowBal / 2; // close factor 50%
+        (uint256 err, uint256 seizeTokens) = IComptrollerActions(COMPTROLLER)
+            .liquidateCalculateSeizeTokens(M_USDC, M_WETH, repay);
+        require(err == 0, "seize calc gagal");
+        uint256 rate = IMTokenFull(M_WETH).exchangeRateStored();
+        // liquidateCalculateSeizeTokens mengembalikan sitaan BRUTO; liquidator
+        // hanya menerima (1 - protocolSeizeShare). Kurangi + buffer pembulatan.
+        uint256 seizeShare = IMTokenFull(M_WETH).protocolSeizeShareMantissa();
+        uint256 amountIn = seizeTokens * rate / 1e18 * (1e18 - seizeShare) / 1e18 * 99 / 100;
+
+        Route[] memory routes = new Route[](1);
+        routes[0] = Route({from: WETH, to: USDC, stable: false, factory: AERODROME_FACTORY});
+        bytes memory swapData = abi.encodeWithSelector(
+            bytes4(keccak256("swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)")),
+            amountIn,
+            repay, // amountOutMin: minimal menutup flashloan
+            routes,
+            address(executor),
+            block.timestamp + 600
+        );
+
+        return LiquidationJob({
+            mode: mode,
+            loanToken: IERC20(USDC),
+            swapTarget: AERODROME_ROUTER,
+            swapData: swapData,
+            mTokenLoan: IMToken(M_USDC),
+            mTokenCollateral: IMToken(M_WETH),
+            borrower: borrower,
+            repayAmount: repay,
+            minProfit: 1,
+            minLoanOut: 0
+        });
+    }
+
+    /// Jalur B penuh: flashloan USDC -> liquidateBorrow -> redeem mWETH ->
+    /// swap WETH->USDC di Aerodrome -> repay flashloan -> profit USDC > 0.
+    function testClassicLiquidationEndToEnd() public {
+        address borrower = _createUnderwaterBorrower();
+        LiquidationJob memory job = _buildJob(Mode.Classic, borrower);
+
+        uint256 usdcBefore = IERC20(USDC).balanceOf(address(executor));
+        executor.execute(job);
+
+        assertGt(
+            IERC20(USDC).balanceOf(address(executor)),
+            usdcBefore,
+            "profit USDC harus > 0"
+        );
+        assertEq(executor.expectedCallHash(), bytes32(0), "call hash harus di-clear");
+        assertEq(IERC20(USDC).allowance(address(executor), MORPHO), 0, "allowance morpho harus 0");
+    }
+
+    /// Jalur A penuh: wrapper OEV (di-etch FakeOevWrapper) mengarah ke
+    /// liquidateBorrow; alur sisanya identik dengan jalur B.
+    function testOevLiquidationEndToEnd() public {
+        address borrower = _createUnderwaterBorrower();
+        address wrapper = IOracle(ORACLE).getFeed("WETH");
+        FakeOevWrapper fake = new FakeOevWrapper();
+        vm.etch(wrapper, address(fake).code);
+
+        LiquidationJob memory job = _buildJob(Mode.Oev, borrower);
+
+        uint256 usdcBefore = IERC20(USDC).balanceOf(address(executor));
+        executor.execute(job);
+
+        assertGt(
+            IERC20(USDC).balanceOf(address(executor)),
+            usdcBefore,
+            "profit USDC harus > 0"
+        );
+        assertEq(executor.expectedCallHash(), bytes32(0), "call hash harus di-clear");
+        assertEq(IERC20(USDC).allowance(address(executor), wrapper), 0, "allowance wrapper harus 0");
+    }
+}

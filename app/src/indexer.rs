@@ -38,8 +38,10 @@ impl<P: Provider + Clone> Indexer<P> {
         let latest = self.provider.get_block_number().await?;
         info!(from_block, latest, "bootstrap borrower dari event Borrow");
 
-        // Chunk agar RPC publik tidak overload.
-        let chunk = 50_000u64;
+        // Chunk agar RPC publik tidak overload. Bila ditolak (range/limit),
+        // perkecil chunk dan coba ulang rentang yang sama — rentang hanya
+        // dilewati setelah chunk minimum pun gagal.
+        let mut chunk = 50_000u64;
         let mut start = from_block;
         while start <= latest {
             let end = (start + chunk).min(latest);
@@ -60,10 +62,17 @@ impl<P: Provider + Clone> Indexer<P> {
                             }
                         }
                     }
+                    start = end + 1;
                 }
-                Err(e) => warn!(?e, start, end, "get_logs gagal"),
+                Err(e) if chunk > 2_000 => {
+                    chunk /= 5;
+                    warn!(?e, chunk, "get_logs ditolak — perkecil chunk, coba ulang");
+                }
+                Err(e) => {
+                    warn!(?e, start, end, "get_logs gagal — rentang dilewati");
+                    start = end + 1;
+                }
             }
-            start = end + 1;
         }
         info!(count = self.state.borrowers().len(), "bootstrap selesai");
         Ok(())

@@ -90,7 +90,7 @@ git submodule update --init --recursive
 
 ```bash
 cd contracts
-BASE_RPC_URL="https://mainnet.base.org" forge test          # 9/9 harus lulus
+BASE_RPC_URL="https://mainnet.base.org" forge test          # 11/11 harus lulus
 forge create --rpc-url "$BASE_RPC_URL" \
   --private-key "$DEPLOYER_KEY" \
   src/OevLiquidator.sol:OevLiquidator
@@ -145,8 +145,11 @@ hapus file itu untuk bootstrap ulang dari chain.
 
 ## Pengujian
 
-- `cd contracts && forge test` — fork test di state Base asli, termasuk
-  validasi calldata swap Aerodrome (`testAerodromeSwapWorks`).
+- `cd contracts && forge test` — fork test di state Base asli (11 test),
+  termasuk end-to-end happy path: borrower dibuat underwater via mock oracle,
+  lalu dieksekusi penuh (flashloan → liquidate → redeem → swap → profit)
+  untuk jalur Classic maupun OEV (`testClassicLiquidationEndToEnd`,
+  `testOevLiquidationEndToEnd`).
 - `cd app && cargo build` — compile bot.
 
 ## Keamanan operasional

@@ -1,8 +1,8 @@
 use crate::contracts::{IOevLiquidator, LiquidationJob};
 use alloy::network::EthereumWallet;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::fillers::{FillProvider, JoinFill, WalletFiller};
-use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, GasFiller, NonceFiller,
 };
@@ -31,6 +31,9 @@ pub struct Submitter {
     /// task (scan reguler + trigger OEV) mengirim likuidasi yang sama
     /// bersamaan dan membuang gas.
     in_flight: std::sync::Arc<dashmap::DashSet<(Address, Address)>>,
+    /// Batas biaya gas per tx (wei ETH). Simulasi profit yang lolos tetap
+    /// bisa rugi bersih bila gas mahal — tx di atas batas ini tidak dikirim.
+    max_gas_cost: U256,
 }
 
 /// RAII guard: hapus key dedup saat scope submit berakhir (sukses maupun error).
@@ -51,6 +54,7 @@ impl Submitter {
         signer: PrivateKeySigner,
         executor: Address,
         flashblocks_endpoint: Option<Url>,
+        max_gas_cost: U256,
     ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer);
         let provider = ProviderBuilder::new()
@@ -62,7 +66,7 @@ impl Submitter {
             ProviderBuilder::new().wallet(wallet).connect_http(url)
         });
 
-        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()) })
+        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()), max_gas_cost })
     }
 
     /// Simulasi dulu; kalau lolos baru kirim transaksi nyata.
@@ -87,7 +91,24 @@ impl Submitter {
             }
         }
 
-        // 2. Kirim. Bila ada provider flashblocks, kirim lewat endpoint private;
+        // 2. Guard biaya gas: estimasi gas x gas price tidak boleh melebihi
+        //    batas — profit on-chain tidak menghitung ETH yang keluar untuk gas.
+        match contract.execute(job.clone()).estimate_gas().await {
+            Ok(gas) => {
+                let gas_price = self.provider.get_gas_price().await.unwrap_or(0);
+                let cost = U256::from(gas) * U256::from(gas_price);
+                if cost > self.max_gas_cost {
+                    warn!(gas, gas_price, %cost, "estimasi gas melebihi batas — job dibatalkan");
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!(?e, "estimasi gas gagal — job dibatalkan");
+                return Ok(());
+            }
+        }
+
+        // 3. Kirim. Bila ada provider flashblocks, kirim lewat endpoint private;
         //    kalau tidak, mempool publik.
         match self.flashblocks {
             Some(ref fb_provider) => {

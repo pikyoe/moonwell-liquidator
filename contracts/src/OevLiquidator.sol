@@ -34,6 +34,10 @@ interface IOracle {
     function getFeed(string memory symbol) external view returns (address);
 }
 
+interface IWETH9 {
+    function deposit() external payable;
+}
+
 interface IComptroller {
     function oracle() external view returns (address);
 }
@@ -68,8 +72,14 @@ contract OevLiquidator {
 
     IMorpho public constant morpho = IMorpho(0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb);
     IComptroller public constant comptroller = IComptroller(0xfBb21d0380beE3312B33c4353c8936a0F13EF26C);
+    address public constant WETH = 0x4200000000000000000000000000000000000006;
 
     address public immutable owner;
+
+    /// mWETH Moonwell mengirim ETH NATIVE saat redeem (unwrap otomatis via
+    /// `.send`, gas limit 2300) — receive() harus ada dan tetap ringan.
+    /// ETH langsung dibungkus kembali ke WETH di callback (lihat bawah).
+    receive() external payable {}
 
     /// Hash job yang sah untuk callback flashloan berikutnya.
     /// Hanya execute() (onlyOwner) yang boleh mengaturnya. Callback hanya
@@ -79,6 +89,17 @@ contract OevLiquidator {
     bytes32 public expectedCallHash;
 
     error NotProfitable(uint256 profit, uint256 minProfit);
+
+    /// Dipancarkan setelah tiap likuidasi sukses — untuk monitoring & akuntansi
+    /// off-chain (profit dalam satuan profitToken).
+    event Liquidated(
+        address indexed borrower,
+        address indexed mTokenLoan,
+        address indexed mTokenCollateral,
+        uint256 repayAmount,
+        uint256 profit,
+        address profitToken
+    );
 
     constructor() {
         owner = msg.sender;
@@ -108,6 +129,14 @@ contract OevLiquidator {
         // Reset allowance Morpho yang diset di callback.
         job.loanToken.forceApprove(address(morpho), 0);
         if (profit < job.minProfit) revert NotProfitable(profit, job.minProfit);
+        emit Liquidated(
+            job.borrower,
+            address(job.mTokenLoan),
+            address(job.mTokenCollateral),
+            job.repayAmount,
+            profit,
+            address(profitToken)
+        );
     }
 
     function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
@@ -130,6 +159,14 @@ contract OevLiquidator {
         require(job.mTokenCollateral.redeem(seized) == 0, "redeem failed");
 
         IERC20 collateralUnderlying = IERC20(job.mTokenCollateral.underlying());
+
+        // Hasil redeem market WETH berupa ETH native — bungkus kembali agar
+        // alur swap & akuntansi profit (ERC20) bekerja. Tanpa ini, saldo WETH
+        // kontrak nol dan swap/profit check selalu gagal untuk kolateral WETH.
+        if (address(collateralUnderlying) == WETH) {
+            uint256 ethBal = address(this).balance;
+            if (ethBal > 0) IWETH9(WETH).deposit{value: ethBal}();
+        }
 
         // Swap opsional: konversi kolateral -> loanToken supaya flashloan tertutup.
         // Dilewati bila swapTarget == address(0) (mode tanpa swap).
@@ -193,5 +230,11 @@ contract OevLiquidator {
     /// menambah gas transfer di setiap likuidasi.
     function sweep(address token, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(owner, amount);
+    }
+
+    /// Sedot ETH native (mis. terkirim di luar alur redeem) ke owner.
+    function sweepEth() external onlyOwner {
+        (bool ok,) = owner.call{value: address(this).balance}("");
+        require(ok, "sweep eth failed");
     }
 }
