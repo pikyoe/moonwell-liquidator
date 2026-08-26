@@ -42,6 +42,20 @@ async fn main() -> Result<()> {
     let signer: PrivateKeySigner = cfg.private_key.parse()?;
     let executor = cfg.executor_address()?;
 
+    // Parse whitelist wrapper OEV sekali; errors dicatat tapi tidak fatal.
+    let oev_wrappers: Vec<Address> = cfg
+        .oev_wrappers
+        .iter()
+        .filter_map(|s| {
+            Address::from_str(s)
+                .map_err(|e| warn!(?e, addr = s, "oev_wrappers alamat tidak valid — di-skip"))
+                .ok()
+        })
+        .collect();
+    if !oev_wrappers.is_empty() {
+        info!(count = oev_wrappers.len(), "wrapper OEV dipantau untuk UpdatedPrices");
+    }
+
     let markets = build_market_map(&http, &cfg).await?;
     info!(count = markets.len(), "market dimuat");
 
@@ -97,14 +111,36 @@ async fn main() -> Result<()> {
 
         // Submitter non-blocking: enqueue di sini, join di akhir.
         let mut tasks = tokio::task::JoinSet::new();
+        // Catat blok terakhir yang diproses agar rentang terlewat
+        // (drop WS / lag subscriber) bisa di-replay.
+        let mut last_processed: Option<u64> = None;
 
         while let Some(block) = stream.next().await {
             let number = block.number;
             info!(number, "blok baru");
 
+            // Replay rentang yang terlewat sejak blok terakhir yang diproses.
+            if let Some(prev) = last_processed {
+                if number > prev + 1 {
+                    if let Err(e) = indexer.process_block_logs(prev + 1, number).await {
+                        warn!(?e, prev, number, "resync rentang gagal");
+                    }
+                }
+            }
+
             // Perbarui posisi semua akun dari event di blok ini.
-            if let Err(e) = indexer.watch_block(number).await {
+            if let Err(e) = indexer.watch_block(number, number).await {
                 warn!(?e, number, "gagal memproses log blok");
+            }
+            last_processed = Some(number);
+
+            // Trigger wrapper OEV — scan langsung tanpa perlu menunggu refresh 10-blok.
+            if !oev_wrappers.is_empty() {
+                match indexer.check_price_trigger(number, &oev_wrappers).await {
+                    Ok(true) => spawn_scan(strategy.clone(), submitter.clone(), cfg.clone()).await,
+                    Ok(false) => {}
+                    Err(e) => warn!(?e, "cek trigger OEV gagal"),
+                }
             }
 
             if number % 10 == 0 {
@@ -205,13 +241,46 @@ async fn refresh_prices<P: Provider + Clone>(
     let close_factor = comptroller.closeFactorMantissa().call().await?;
     let incentive = comptroller.liquidationIncentiveMantissa().call().await?;
 
-    let mut s = strategy.lock().await;
-    s.update_comptroller_params(close_factor, incentive);
+    // Ambil harga SEMUA market terlebih dahulu di luar kunci — network I/O boleh
+    // lambat, sehingga mengambil mutex di dalam loop per-RPC akan men-stall scan.
+    let mut prices = Vec::new();
     for m in &cfg.markets {
         let mtoken = Address::from_str(&m.mtoken)?;
         if let Ok(p) = oracle.getUnderlyingPrice(mtoken).call().await {
-            s.update_price(mtoken, p);
+            prices.push((mtoken, p));
         }
     }
+
+    // Apply cache di dalam kunci tanpa await network.
+    let mut s = strategy.lock().await;
+    s.update_comptroller_params(close_factor, incentive);
+    for (mtoken, price) in prices {
+        s.update_price(mtoken, price);
+    }
     Ok(())
+}
+
+/// Jalankan scan + submit karena trigger UpdatedPrices — terpisah dari task
+/// set reguler blok agar scan trigger tidak harus menunggu iterasi blok baru.
+async fn spawn_scan<P: Provider + Clone>(
+    strategy: Arc<Mutex<Strategy<P>>>,
+    submitter: Arc<Submitter>,
+    cfg: Config,
+) {
+    if let Ok(jobs) = strategy.lock().await.scan_opportunities().await {
+        for job in jobs {
+            let submitter = submitter.clone();
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = submitter.simulate_and_send(job.clone()).await {
+                    warn!(?e, "trigger-OEV kirim jalur A gagal");
+                    if cfg.classic_fallback {
+                        let mut jb = job;
+                        jb.mode = Mode::Classic;
+                        let _ = submitter.simulate_and_send(jb).await;
+                    }
+                }
+            });
+        }
+    }
 }

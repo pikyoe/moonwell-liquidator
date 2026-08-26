@@ -23,20 +23,10 @@ pub type SigningProvider = FillProvider<
 pub struct Submitter {
     provider: SigningProvider,
     executor: Address,
-    /// `flashblocks.controllerUrl` opsional — endpoint Base flashblocks untuk mempublikasikan
-    /// preconf agar submission langsung ke builder (mencoungkan kemenangan race).
-    /// Di luar nonce yang akan tercheckout oleh sequencer ke default endpoint.
-    flashblocks_endpoint: Option<Url>,
-}
-
-/// HASIL TX — disiapkan untuk metrik, belum digunakan. Dideklarasikan
-/// eksplisit untuk menjejak bahwa submitter hanya mengembalikan Result
-/// (void) daripada struktur (hash, ok, gas_used).
-#[allow(dead_code)]
-struct SendOutcome {
-    hash: alloy::primitives::TxHash,
-    ok: bool,
-    gas_used: u64,
+    /// Provider khusus endpoint private (Base Flashblocks). Dibangun sekali di
+    /// `new` bila `flashblocks_endpoint` diisi — sehingga send benar-benar
+    /// melewati endpoint itu, bukan mempool publik.
+    flashblocks: Option<SigningProvider>,
 }
 
 impl Submitter {
@@ -48,9 +38,15 @@ impl Submitter {
     ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer);
         let provider = ProviderBuilder::new()
-            .wallet(wallet)
+            .wallet(wallet.clone())
             .connect_http(rpc_http);
-        Ok(Self { provider, executor, flashblocks_endpoint })
+
+        // Bila endpoint private diisi, bangun provider terpisah dengan wallet yang sama.
+        let flashblocks = flashblocks_endpoint.map(|url| {
+            ProviderBuilder::new().wallet(wallet).connect_http(url)
+        });
+
+        Ok(Self { provider, executor, flashblocks })
     }
 
     /// Simulasi dulu; kalau lolos baru kirim transaksi nyata.
@@ -67,44 +63,25 @@ impl Submitter {
             }
         }
 
-        // 2. Kirim. Bila ada endpoint flashblocks, gunakan; jika tidak, default public mempool.
-        let send_url = match self.flashblocks_endpoint {
-            Some(ref url) => url.clone(),
-            None => return self
-                .default_send(&contract, job)
-                .await,
-        };
-        // Public mempencil payload: env.flashblocks_endpoint dirujuk one atau tidak.
-        self.send_tx(&contract, job, send_url).await
-    }
-
-    /// Memo: endpoint endpoint tidak dikontfigurmana → kirim via public mempuff.
-    async fn default_send(&self, contract: &crate::contracts::IOevLiquidator::IOevLiquidatorInstance<&SigningProvider>, job: LiquidationJob) -> Result<()> {
-        let pending = contract.execute(job).send().await?;
-        let hash = *pending.tx_hash();
-        let receipt = pending.get_receipt().await?;
-        info!(?hash, status = receipt.status(), gas_used = receipt.gas_used, "receipt");
-        Ok(())
-    }
-
-    /// Mengirim le transport yang ditentu — hanya utilizat satu kali.
-
-    async fn send_tx(
-        &self,
-        contract: &crate::contracts::IOevLiquidator::IOevLiquidatorInstance<&SigningProvider>,
-        job: LiquidationJob,
-        url: Url,
-    ) -> Result<()> {
-        let _unused_provider = ProviderBuilder::new().connect_http(url); // kept untuk endpoint transport berbeda
-        let pending = contract
-            .execute(job)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("send gagal: {e}"))?;
-        let hash = *pending.tx_hash();
-        info!(?hash, "tx terkirim (private bundle)");
-        let receipt = pending.get_receipt().await?;
-        info!(status = receipt.status(), gas_used = receipt.gas_used, "receipt");
+        // 2. Kirim. Bila ada provider flashblocks, kirim lewat endpoint private;
+        //    kalau tidak, mempool publik.
+        match self.flashblocks {
+            Some(ref fb_provider) => {
+                let fb_contract = IOevLiquidator::new(self.executor, fb_provider);
+                let pending = fb_contract.execute(job).send().await?;
+                let hash = *pending.tx_hash();
+                info!(?hash, "tx terkirim (private bundle)");
+                let receipt = pending.get_receipt().await?;
+                info!(status = receipt.status(), gas_used = receipt.gas_used, "receipt");
+            }
+            None => {
+                let pending = contract.execute(job).send().await?;
+                let hash = *pending.tx_hash();
+                info!(?hash, "tx terkirim (mempool publik)");
+                let receipt = pending.get_receipt().await?;
+                info!(status = receipt.status(), gas_used = receipt.gas_used, "receipt");
+            }
+        }
         Ok(())
     }
 }
