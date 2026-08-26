@@ -80,4 +80,52 @@ impl<P: Provider + Clone> Indexer<P> {
         );
         Ok(())
     }
+
+    /// Proses log di range blok: decode semua event yang mempengaruhi posisi.
+    /// Dipakai untuk sync setelah reconnect atau bootstrap lanjutan.
+    pub async fn process_block_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
+        let filter = Filter::new()
+            .address(self.markets.clone())
+            .from_block(from_block)
+            .to_block(to_block);
+        let logs = self.provider.get_logs(&filter).await?;
+        for log in logs {
+            let market = log.address();
+            if let Ok(ev) = Borrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handler terang untuk semua event posisi. Dipanggil per blok oleh main loop.
+    pub async fn watch_block(&self, block_number: u64) -> Result<()> {
+        let events = Filter::new()
+            .address(self.markets.clone())
+            .from_block(block_number)
+            .to_block(block_number);
+        let logs = self.provider.get_logs(&events).await?;
+        for log in logs {
+            let market = log.address();
+            let topics = log.topics();
+            if topics.len() >= 3 && topics[0] == Transfer::SIGNATURE_HASH {
+                // Transfer (mToken movement) → refresh from & to
+                if let Ok(ev) = Transfer::decode_log(&log.inner) {
+                    let _ = self.refresh_account(market, ev.from).await;
+                    let _ = self.refresh_account(market, ev.to).await;
+                }
+            } else if let Ok(ev) = Mint::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.minter).await;
+            } else if let Ok(ev) = Redeem::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.redeemer).await;
+            } else if let Ok(ev) = Borrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            } else if let Ok(ev) = RepayBorrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            } else if let Ok(ev) = LiquidateBorrow::decode_log(&log.inner) {
+                let _ = self.refresh_account(market, ev.borrower).await;
+            }
+        }
+        Ok(())
+    }
 }

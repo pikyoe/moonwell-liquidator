@@ -66,6 +66,11 @@ async fn main() -> Result<()> {
     let strategy = Arc::new(tokio::sync::Mutex::new(
         Strategy::new(http.clone(), state.clone(), cfg.clone(), markets)?,
     ));
+    // Muat harga + param comptroller sekali di start agar close_factor tidak nol
+    // di scan pertama.
+    if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+        warn!(?e, "refresh harga awal gagal — params akan 0 sampai refresh berikutnya");
+    }
     let submitter = Arc::new(Submitter::new(cfg.base_rpc_http.parse()?, signer, executor).await?);
 
     info!("bot berjalan — memantau blok baru");
@@ -88,6 +93,11 @@ async fn main() -> Result<()> {
         while let Some(block) = stream.next().await {
             let number = block.number;
             info!(number, "blok baru");
+
+            // Perbarui posisi semua akun dari event di blok ini.
+            if let Err(e) = indexer.watch_block(number).await {
+                warn!(?e, number, "gagal memproses log blok");
+            }
 
             if number % 10 == 0 {
                 if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
@@ -182,7 +192,13 @@ async fn refresh_prices<P: Provider + Clone>(
     let comptroller = IComptroller::new(COMPTROLLER, provider);
     let oracle_addr = comptroller.oracle().call().await?;
     let oracle = IOracle::new(oracle_addr, provider);
+
+    // Muat close factor & liquidation incentive dari chain — jangan hardcode.
+    let close_factor = comptroller.closeFactorMantissa().call().await?;
+    let incentive = comptroller.liquidationIncentiveMantissa().call().await?;
+
     let mut s = strategy.lock().await;
+    s.update_comptroller_params(close_factor, incentive);
     for m in &cfg.markets {
         let mtoken = Address::from_str(&m.mtoken)?;
         if let Ok(p) = oracle.getUnderlyingPrice(mtoken).call().await {
