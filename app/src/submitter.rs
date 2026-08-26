@@ -27,6 +27,22 @@ pub struct Submitter {
     /// `new` bila `flashblocks_endpoint` diisi — sehingga send benar-benar
     /// melewati endpoint itu, bukan mempool publik.
     flashblocks: Option<SigningProvider>,
+    /// Dedup submission in-flight per (borrower, mTokenLoan) — mencegah dua
+    /// task (scan reguler + trigger OEV) mengirim likuidasi yang sama
+    /// bersamaan dan membuang gas.
+    in_flight: std::sync::Arc<dashmap::DashSet<(Address, Address)>>,
+}
+
+/// RAII guard: hapus key dedup saat scope submit berakhir (sukses maupun error).
+struct InFlightGuard {
+    set: std::sync::Arc<dashmap::DashSet<(Address, Address)>>,
+    key: (Address, Address),
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set.remove(&self.key);
+    }
 }
 
 impl Submitter {
@@ -46,11 +62,19 @@ impl Submitter {
             ProviderBuilder::new().wallet(wallet).connect_http(url)
         });
 
-        Ok(Self { provider, executor, flashblocks })
+        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()) })
     }
 
     /// Simulasi dulu; kalau lolos baru kirim transaksi nyata.
     pub async fn simulate_and_send(&self, job: LiquidationJob) -> Result<()> {
+        let key = (job.borrower, job.mTokenLoan);
+        // Skip bila likuidasi identik sedang in-flight (trigger OEV + scan).
+        if !self.in_flight.insert(key) {
+            tracing::debug!(?key, "job sedang diproses — duplikat di-skip");
+            return Ok(());
+        }
+        let _guard = InFlightGuard { set: self.in_flight.clone(), key };
+
         let contract = IOevLiquidator::new(self.executor, &self.provider);
 
         // 1. eth_call simulasi — skip bila gagal.

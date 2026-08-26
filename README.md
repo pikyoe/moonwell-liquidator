@@ -59,7 +59,7 @@ kembalikan flashloan → sisa jadi profit di kontrak.
 
 ```bash
 cd contracts
-BASE_RPC_URL="https://mainnet.base.org" forge test          # 7/7 harus lulus
+BASE_RPC_URL="https://mainnet.base.org" forge test          # 9/9 harus lulus
 forge create --rpc-url "$BASE_RPC_URL" \
   --private-key "$DEPLOYER_KEY" \
   src/OevLiquidator.sol:OevLiquidator
@@ -77,7 +77,8 @@ Isi:
 - `base_rpc_http`, `base_rpc_ws` — RPC Anda
 - `private_key` — kunci signer bot (bukan pemilik kontrak; keduanya boleh sama)
 - `executor_address` — alamat kontrak dari langkah 1
-- `min_profit_wei` — ambang profit minimal (default 1e15 wei ≈ $0.30 jika loan=WETH)
+- `min_profit_wei` — ambang profit minimal (wei token hasil akhir); gunakan
+  `min_profit_per_symbol` untuk override per market (desimal beda-beda)
 - `[swap]` — router Aerodrome, `slippage_bps` (default 200 = 2%), 
   `liquidator_fee_bps` (default 3000 = 30% bagian liquidator OEV)
 

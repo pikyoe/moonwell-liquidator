@@ -85,9 +85,9 @@ impl<P: Provider + Clone> Indexer<P> {
         Ok(())
     }
 
-    /// Proses rentang blok — decode **semua** event posisi (dulu hanya Borrow,
-    /// sehingga rentang resync melemparkan 5 event lain). Taxa sekarang digunakan
-    /// minter holdersre antara saat max reconnect WS.
+    /// Proses rentang blok — decode **semua** event posisi (Mint/Redeem/Borrow/
+    /// Repay/Liquidate/Transfer), dipakai untuk replay rentang yang terlewat
+    /// saat reconnect WS.
     pub async fn process_block_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
         self.watch_block(from_block, to_block).await
     }

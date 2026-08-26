@@ -1,14 +1,23 @@
 base_rpc_http = "https://mainnet.base.org"
 base_rpc_ws   = "wss://YOUR_RPC_WS"
-# opsional: endpoint flashblocks Base untuk submit bundle private (hindari race mempublis)
-# flashblocks_endpoint = "https://sepolia-preconf.flashbots.net"
+# opsional: endpoint Flashblocks Base MAINNET (bukan sepolia) untuk preconf 200ms.
+# Semua public endpoint Base sudah Flashblocks-enabled (docs.base.org); contoh:
+#   https://mainnet.flashblocks.base.org
+# Gunakan endpoint provider privat (Alchemy/QuickNode/Chainstack) bila ingin
+# jalur submit privat - tx via mempool publik tetap front-runnable.
+# flashblocks_endpoint = "https://mainnet.flashblocks.base.org"
 private_key   = "0x..."
 executor_address = "0x..."
 
 # batas posisi per likuidasi, USD
 max_position_usd = 25000
-# minimum profit dalam wei collateral token (isi "0" jika ingin selalu kirim)
+# minimum profit dalam wei TOKEN HASIL AKHIR (loan token bila swap aktif,
+# kolateral bila tidak). Fallback bila simbol tidak ada di map di bawah.
 min_profit_wei = "0"
+# Override per simbol — penting karena desimal beda (WETH 18, USDC 6, cbBTC 8).
+# [min_profit_per_symbol]
+# WETH = "1000000000000000"   # 0.001 ETH
+# USDC = "300000"             # 0.30 USDC
 # fallback jalur B
 classic_fallback = true
 

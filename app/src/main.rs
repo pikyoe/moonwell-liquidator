@@ -8,7 +8,7 @@ mod submitter;
 mod swap;
 
 use crate::config::Config;
-use crate::contracts::{IComptroller, IOracle, Mode, COMPTROLLER};
+use crate::contracts::{IComptroller, IOevLiquidator, IOracle, Mode, COMPTROLLER};
 use crate::health::MarketInfo;
 use crate::indexer::Indexer;
 use crate::state::{AccountState, SharedState};
@@ -41,6 +41,18 @@ async fn main() -> Result<()> {
 
     let signer: PrivateKeySigner = cfg.private_key.parse()?;
     let executor = cfg.executor_address()?;
+
+    // Signer harus owner kontrak executor — execute() bertipe onlyOwner.
+    // eth_call alloy mengisi `from` = alamat signer; kalau beda, semua
+    // simulasi diam-diam revert "not owner". Gagal cepat dengan pesan jelas.
+    let executor_contract = IOevLiquidator::new(executor, &http);
+    let onchain_owner = executor_contract.owner().call().await?;
+    let signer_addr = signer.address();
+    anyhow::ensure!(
+        onchain_owner == signer_addr,
+        "signer {signer_addr:?} bukan owner executor {executor:?} (owner on-chain: {onchain_owner:?})"
+    );
+    info!(owner = ?signer_addr, executor = ?executor, "kepemilikan executor terverifikasi");
 
     // Parse whitelist wrapper OEV sekali; errors dicatat tapi tidak fatal.
     let oev_wrappers: Vec<Address> = cfg
@@ -216,10 +228,8 @@ async fn build_market_map<P: Provider>(
         map.insert(
             mtoken,
             MarketInfo {
-                mtoken,
                 underlying,
                 symbol: m.symbol.clone(),
-                decimals: m.decimals,
                 collateral_factor,
                 price,
             },

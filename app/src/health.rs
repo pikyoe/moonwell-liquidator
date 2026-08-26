@@ -4,10 +4,8 @@ use alloy::primitives::{Address, U256};
 /// Menggunakan harga 1e36-normalized dari oracle Moonwell.
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
-    pub mtoken: Address,
     pub underlying: Address,
     pub symbol: String,
-    pub decimals: u8,
     pub collateral_factor: U256, // 1e18
     pub price: U256,             // 1e(36-decimals)
 }
@@ -28,7 +26,6 @@ impl MarketInfo {
 pub enum Health {
     Safe,
     Liquidatable,   // HF < 1
-    Unknown,
 }
 
 pub fn health_factor(
@@ -68,5 +65,47 @@ pub fn classify(hf: U256) -> Health {
         Health::Liquidatable
     } else {
         Health::Safe
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn market(price: U256, cf: U256) -> MarketInfo {
+        MarketInfo {
+            underlying: Address::ZERO,
+            symbol: "X".into(),
+            collateral_factor: cf,
+            price,
+        }
+    }
+
+    #[test]
+    fn hf_liquidatable_di_bawah_satu() {
+        let mkt = Address::from([1u8; 20]);
+        let one = U256::from(10u64.pow(18));
+        // supply 10 * rate 1 = 10 units, price 1e36 -> $10e18; CF 0.5 -> $5e18 efektif
+        // borrow 7 units * $1 = $7e18 -> HF = 5/7 < 1
+        let price = U256::from(10u64).pow(U256::from(36u64));
+        let mut markets = HashMap::new();
+        markets.insert(mkt, market(price, one / U256::from(2u64)));
+        let pos = vec![(mkt, U256::from(10u64) * one, U256::from(7u64) * one, one)];
+        let (_, _, hf) = health_factor(&pos, &markets);
+        assert_eq!(classify(hf), Health::Liquidatable);
+    }
+
+    #[test]
+    fn hf_safe_tanpa_borrow() {
+        let mut markets = HashMap::new();
+        let mkt = Address::from([2u8; 20]);
+        markets.insert(mkt, market(U256::from(10u64).pow(U256::from(36u64)), U256::from(10u64.pow(18))));
+        let one = U256::from(10u64.pow(18));
+        let pos = vec![(mkt, one, U256::ZERO, one)];
+        let (_, _, hf) = health_factor(&pos, &markets);
+        assert_eq!(hf, U256::MAX);
+        assert_eq!(classify(hf), Health::Safe);
     }
 }
