@@ -1,0 +1,78 @@
+base_rpc_http = "https://mainnet.base.org"
+base_rpc_ws   = "wss://YOUR_RPC_WS"
+private_key   = "0x..."
+executor_address = "0x..."
+
+# batas posisi per likuidasi, USD
+max_position_usd = 25000
+# minimum profit dalam wei collateral token (isi "0" jika ingin selalu kirim)
+min_profit_wei = "0"
+# fallback jalur B
+classic_fallback = true
+
+[swap]
+enabled = true
+router  = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"  # Aerodrome Router (Base)
+slippage_bps = 200          # 2% slippage guard
+liquidator_fee_bps = 3000   # 30% bagian liquidator di jalur OEV
+
+# Moonwell Base mTokens (diverifikasi dari docs Moonwell)
+[[markets]]
+symbol = "WETH"
+mtoken = "0x628ff693426583D9a7FB391E54366292F509D457"
+underlying = "0x4200000000000000000000000000000000000006"
+decimals = 18
+
+[[markets]]
+symbol = "USDC"
+mtoken = "0xEdc817A28E8B93B03976FBd4a3dDBc9f7D176c22"
+underlying = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+decimals = 6
+
+[[markets]]
+symbol = "cbBTC"
+mtoken = "0xF877ACaFA28c19b96727966690b2f44d35aD5976"
+underlying = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"
+decimals = 8
+
+[[markets]]
+symbol = "wstETH"
+mtoken = "0x627Fe393Bc6EdDA28e99AE648fD6fF362514304b"
+underlying = "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"
+decimals = 18
+
+[[markets]]
+symbol = "rETH"
+mtoken = "0xcb1dacd30638ae38f2b94ea64f066045b7d45f44"
+underlying = "0xB6fe221Fe9EeF5aBa221c348bA20A1Bf5e73624c"
+decimals = 18
+
+[[markets]]
+symbol = "weETH"
+mtoken = "0xb8051464C8c92209C92F3a4CD9C73746C4c3CFb3"
+underlying = "0x04C0599Ae5A44757c0af6F9eC11b19fd6476E75a"
+decimals = 18
+
+[[markets]]
+symbol = "AERO"
+mtoken = "0x73902f619CEB9B31FD8EFecf435CbDf89E369Ba6"
+underlying = "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+decimals = 18
+
+[[markets]]
+symbol = "EURC"
+mtoken = "0xb682c840B5F4FC58B20769E691A6fa1305A501a2"
+underlying = "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"
+decimals = 6
+
+[[markets]]
+symbol = "USDS"
+mtoken = "0xb6419c6C2e60c4025D6D06eE4F913ce89425a357"
+underlying = "0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"
+decimals = 18
+
+[[markets]]
+symbol = "DAI"
+mtoken = "0x73b06D8d18De422E269645eaCe15400DE7462417"
+underlying = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+decimals = 18

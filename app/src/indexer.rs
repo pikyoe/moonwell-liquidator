@@ -1,0 +1,83 @@
+use crate::contracts::IMToken;
+use crate::state::SharedState;
+use alloy::primitives::Address;
+use alloy::providers::Provider;
+use alloy::rpc::types::Filter;
+use alloy::sol_types::SolEvent;
+use anyhow::Result;
+use tracing::{info, warn};
+
+// Event yang mempengaruhi posisi. Kita pantau Mint/Borrow/Repay/Redeem/Transfer.
+alloy::sol! {
+    event Mint(address minter, uint256 mintAmount, uint256 mintTokens);
+    event Redeem(address redeemer, uint256 redeemAmount, uint256 redeemTokens);
+    event Borrow(address borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+    event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
+}
+
+pub struct Indexer<P: Provider> {
+    provider: P,
+    state: SharedState,
+    markets: Vec<Address>,
+}
+
+impl<P: Provider + Clone> Indexer<P> {
+    pub fn new(provider: P, state: SharedState, markets: Vec<Address>) -> Self {
+        Self { provider, state, markets }
+    }
+
+    /// Bootstrap: scan event Borrow historis untuk menemukan semua borrower aktif.
+    /// Ini membangun daftar akun awal yang akan dipantau health-nya.
+    pub async fn bootstrap_borrowers(&self, from_block: u64) -> Result<()> {
+        let latest = self.provider.get_block_number().await?;
+        info!(from_block, latest, "bootstrap borrower dari event Borrow");
+
+        // Chunk agar RPC publik tidak overload.
+        let chunk = 50_000u64;
+        let mut start = from_block;
+        while start <= latest {
+            let end = (start + chunk).min(latest);
+            let filter = Filter::new()
+                .address(self.markets.clone())
+                .event_signature(Borrow::SIGNATURE_HASH)
+                .from_block(start)
+                .to_block(end);
+            match self.provider.get_logs(&filter).await {
+                Ok(logs) => {
+                    for log in logs {
+                        if let Ok(ev) = Borrow::decode_log(&log.inner) {
+                            let borrower = ev.borrower;
+                            // snapshot akun ini di market tsb
+                            let market = log.address();
+                            if let Err(e) = self.refresh_account(market, borrower).await {
+                                warn!(?e, "refresh awal gagal");
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(?e, start, end, "get_logs gagal"),
+            }
+            start = end + 1;
+        }
+        info!(count = self.state.borrowers().len(), "bootstrap selesai");
+        Ok(())
+    }
+
+    /// Refresh satu posisi akun di satu market dari chain.
+    pub async fn refresh_account(&self, market: Address, account: Address) -> Result<()> {
+        let m = IMToken::new(market, &self.provider);
+        let snap = m.getAccountSnapshot(account).call().await?;
+        self.state.upsert(
+            account,
+            market,
+            crate::state::Position {
+                mtoken_balance: snap.mTokenBalance,
+                borrow_balance: snap.borrowBalance,
+                exchange_rate: snap.exchangeRateMantissa,
+            },
+        );
+        Ok(())
+    }
+}
