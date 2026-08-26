@@ -51,9 +51,40 @@ kembalikan flashloan → sisa jadi profit di kontrak.
 ## Setup
 
 ### Prasyarat
+- OS: Linux / macOS (WSL2 untuk Windows)
 - Rust (rustup) + Foundry (forge)
 - RPC Base dengan websocket + flashblocks (HTTP juga dipakai)
 - Sedikit ETH di wallet signer untuk gas
+
+### 0. Instal toolchain (sekali)
+
+Jalankan perintah ini satu per satu di terminal:
+
+```bash
+# 1) Rust — compiler bot
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env          # atau buka shell baru agar `cargo` tersedia
+
+# 2) Foundry — compiler & test kontrak Solidity
+curl -L https://foundry.paradigm.xyz | bash
+source ~/.bashrc             # muat ulang PATH agar `foundryup` tersedia
+foundryup                    # install forge/cast/anvil
+
+# 3) Git (biasanya sudah ada)
+sudo apt-get install -y git  # Ubuntu/Debian; macOS: xcode-select --install
+```
+
+Cek hasilnya (harus menampilkan versi):
+
+```bash
+cargo --version   # contoh: cargo 1.8x
+forge --version   # contoh: forge v1.7.x
+git --version
+
+# Clone repo (sesuaikan URL Anda) dan siapkan submodule lib kontrak
+git clone <URL_REPO> && cd moonwell-liquidator
+git submodule update --init --recursive
+```
 
 ### 1. Deploy kontrak
 
