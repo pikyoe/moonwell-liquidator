@@ -56,6 +56,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         let mut chunk = 50_000u64;
         let mut start = from_block;
         let mut backoff = Duration::from_millis(1500);
+        // Cap retry berturut-turut saat 429 — kalau provider terus membatasi
+        // (kuota habis), jangan menjebak startup selamanya; setelah batas ini
+        // fall-through ke jalur perkecil-chunk / lewati agar bot tetap mulai.
+        let mut rate_limit_retries = 0u32;
+        const MAX_RATE_LIMIT_RETRIES: u32 = 10;
         while start <= latest {
             let end = (start + chunk).min(latest);
             let filter = Filter::new()
@@ -66,6 +71,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
             match self.provider.get_logs(&filter).await {
                 Ok(logs) => {
                     backoff = Duration::from_millis(1500);
+                    rate_limit_retries = 0;
                     for log in logs {
                         if let Ok(ev) = Borrow::decode_log(&log.inner) {
                             let borrower = ev.borrower;
@@ -81,8 +87,9 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                 // Rate limit (429) — jangan lewati rentang; tidur dulu agar
                 // provider pulih, lalu coba ulang rentang yang sama. Ini
                 // penting agar bootstrap TIDAK melewati blok yang belum di-scan.
-                Err(e) if is_rate_limited(&e) => {
-                    warn!(?e, backoff_ms = backoff.as_millis(), start, end, "rate limit — tidur lalu coba ulang");
+                Err(e) if is_rate_limited(&e) && rate_limit_retries < MAX_RATE_LIMIT_RETRIES => {
+                    rate_limit_retries += 1;
+                    warn!(?e, rate_limit_retries, capped = MAX_RATE_LIMIT_RETRIES, backoff_ms = backoff.as_millis(), start, end, "rate limit — tidur lalu coba ulang");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
@@ -94,6 +101,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                 Err(e) => {
                     warn!(?e, start, end, "get_logs gagal — rentang dilewati");
                     start = end + 1;
+                    // Awali range baru dengan anggaran retry & backoff segar —
+                    // jangan biarkan cap 429 dari range sebelumnya "menempel"
+                    // sehingga range baru langsung fell-through ke skip.
+                    rate_limit_retries = 0;
+                    backoff = Duration::from_millis(1500);
                 }
             }
         }
