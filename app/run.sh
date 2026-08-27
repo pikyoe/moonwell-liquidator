@@ -64,21 +64,28 @@ start() {
   fi
 
   # Ambil flock atomik dulu: dua `./run.sh start` bersamaan tidak boleh dua-duanya
-  # lolos (TOCTOU). Buka fd 9 dan kunci segera; lock dilepas saat script berakhir.
+  # lolos (TOCTOU). Buka fd 9 dan kunci; lock hanya menjaga window launch —
+  # fd 9 ditutup sebelum meluncurkan child agar tidak bocor ke proses bot.
   exec 9>"$LOCKFILE"
   if ! flock -n 9; then
     echo "Lockfile '$LOCKFILE' terkunci — start lain sedang berjalan."
     exit 1
   fi
-  trap 'rm -f "$PIDFILE"' EXIT   # bersihkan PID bila launcher gagal di tengah
 
+  # Cek dulu apakah bot sudah berjalan; JANGAN pasang trap EXIT sebelum titik ini,
+  # karena trap tersebut akan menghapus PID file bot yang masih hidup saat start
+  # ditolak (exit 1) — membuat bot jadi orphan.
   if is_running; then
     echo "Bot sudah berjalan (PID $(cat "$PIDFILE")). Hentikan dulu: ./run.sh stop"
     exit 1
   fi
 
+  # Arm trap hanya setelah dipastikan launcher ini yang OWN lahan PID — cleanup
+  # hanya berlaku bila peluncuran gagal di tengah.
+  trap 'rm -f "$PIDFILE"' EXIT
+
   rotate_logs
-  nohup "$BIN" >>"$LOG" 2>&1 &
+  nohup "$BIN" >>"$LOG" 2>&1 9<&- &
   echo $! >"$PIDFILE"
   echo "Bot dimulai. PID=$(cat "$PIDFILE")"
   echo "Log: $LOG (ikuti dengan: tail -f $LOG)"
