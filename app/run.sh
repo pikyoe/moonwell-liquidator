@@ -9,11 +9,14 @@
 #   - stop/restart/status via argumen
 #
 # Penggunaan:
-#   ./run.sh            # start (atau tolak bila sudah jalan)
+#   ./run.sh            # start + langsung ikuti log bot (Ctrl+C keluar dari
+#                       #   log, bot tetap berjalan di latar)
 #   ./run.sh start      # sama seperti di atas
+#   ./run.sh start -d   # start tanpa ikuti log (detach)
 #   ./run.sh stop       # hentikan proses (graceful, fallback kill -9)
-#   ./run.sh restart    # stop lalu start
+#   ./run.sh restart    # stop lalu start (ikut log; gunakan `restart -d` utk detach)
 #   ./run.sh status     # status + identitas + log terakhir
+#   ./run.sh logs       # ikuti log bot (tail -f bot.log)
 
 set -euo pipefail
 
@@ -57,6 +60,14 @@ rotate_logs() {
 }
 
 start() {
+  local detach=0
+  # Ambil opsi -d/--detach bila ada (bisa di posisi mana pun).
+  for arg in "$@"; do
+    case "$arg" in
+      -d|--detach) detach=1 ;;
+    esac
+  done
+
   if [ ! -x "$BIN" ]; then
     echo "Binary tidak ditemukan: $BIN"
     echo "Jalankan dulu: cargo build --release"
@@ -65,7 +76,7 @@ start() {
 
   # Ambil flock atomik dulu: dua `./run.sh start` bersamaan tidak boleh dua-duanya
   # lolos (TOCTOU). Buka fd 9 dan kunci; lock hanya menjaga window launch —
-  # fd 9 ditutup sebelum meluncurkan child agar tidak bocor ke proses bot.
+  # dilepas (exec 9>&-) segera setelah bot ter-launch, sebelum menampilkan log.
   exec 9>"$LOCKFILE"
   if ! flock -n 9; then
     echo "Lockfile '$LOCKFILE' terkunci — start lain sedang berjalan."
@@ -85,11 +96,29 @@ start() {
   trap 'rm -f "$PIDFILE"' EXIT
 
   rotate_logs
-  nohup "$BIN" >>"$LOG" 2>&1 9<&- &
+
+  # Luncurkan bot di SESSION tersendiri (setsid): tanpa job control di shell
+  # skrip, bot berbagi process group dengan skrip, jadi Ctrl+C pada `tail -f`
+  # (SIGINT ke foreground process group) akan ikut membunuh bot. setsid
+  # memisahkan session sehingga sinyal terminal tidak menjangkau bot.
+  # Fallback ke nohup bila setsid tidak tersedia.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$BIN" >>"$LOG" 2>&1 9<&- &
+  else
+    nohup "$BIN" >>"$LOG" 2>&1 9<&- &
+  fi
   echo $! >"$PIDFILE"
-  echo "Bot dimulai. PID=$(cat "$PIDFILE")"
-  echo "Log: $LOG (ikuti dengan: tail -f $LOG)"
   trap - EXIT                   # sukses — lepas trap bersih-bersih
+  exec 9>&-                     # lepas flock — lock hanya menjaga window launch
+
+  echo "Bot dimulai. PID=$(cat "$PIDFILE")"
+  if [ "$detach" -eq 1 ]; then
+    echo "Mode detach — log: $LOG (ikuti dengan: ./run.sh logs)"
+  else
+    echo "Menampilkan log (Ctrl+C untuk keluar; bot tetap berjalan)."
+    echo "Log: $LOG"
+    tail -f "$LOG"
+  fi
 }
 
 stop() {
@@ -133,9 +162,11 @@ status() {
 }
 
 case "${1:-start}" in
-  start)    start ;;
+  start)    start "${@:2}" ;;
   stop)     stop ;;
-  restart)  stop; start ;;
+  restart)  stop; start "${@:2}" ;;
   status)   status ;;
+  logs)     [ -f "$LOG" ] || { echo "Belum ada log: $LOG"; exit 1; }
+            tail -f "$LOG" ;;
   *)        echo "Argumen tidak dikenal: $1 (lihat atas file)"; exit 1 ;;
 esac
