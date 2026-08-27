@@ -114,7 +114,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
     pub async fn refresh_account(&self, market: Address, account: Address) -> Result<()> {
         let m = IMToken::new(market, &self.provider);
         let snap = m.getAccountSnapshot(account).call().await?;
-        self.state.upsert(
+        self.state.upsert_or_remove(
             account,
             market,
             crate::state::Position {
@@ -223,7 +223,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                 let _permit = sem.acquire_owned().await;
                 let m = IMToken::new(market, &provider);
                 if let Ok(snap) = m.getAccountSnapshot(account).call().await {
-                    state.upsert(
+                    state.upsert_or_remove(
                         account,
                         market,
                         crate::state::Position {
