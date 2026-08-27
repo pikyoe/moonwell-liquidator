@@ -1,5 +1,16 @@
 base_rpc_http = "https://mainnet.base.org"
 base_rpc_ws   = "wss://YOUR_RPC_WS"
+
+# Envio HyperSync — satu-satunya sumber event log bot.
+# RPC free-tier (Alchemy/QuickNode/Chainstack/Dwellir) memblokir `eth_getLogs`
+# sehingga pembacaan event Borrow/Mint/Repay/Transfer/UpdatedPrices TIDAK bisa
+# lewat RPC biasa. HyperSync adalah query layer yang menuai log tanpa
+# menggunakan eth_getLogs. eth_call dan health-check TETAP memakai base_rpc_http.
+# Daftar endpoint: https://docs.envio.dev/docs/hypersync/overview
+hypersync_url   = "https://base.hypersync.xyz"
+# API token dari dashboard Envio (opsional untuk endpoint publik; wajib untuk
+# kuota lebih besar/private). Dapat juga diisi via env ENVIO_API_TOKEN.
+hypersync_token = ""
 # opsional: endpoint Flashblocks Base MAINNET (bukan sepolia) untuk preconf 200ms.
 # Semua public endpoint Base sudah Flashblocks-enabled (docs.base.org); contoh:
 #   https://mainnet.flashblocks.base.org

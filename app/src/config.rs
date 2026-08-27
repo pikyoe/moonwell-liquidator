@@ -10,6 +10,14 @@ pub struct Config {
     /// menghindari race dengan mempool publik. Contoh mainnet:
     /// "https://mainnet.flashblocks.base.org" (atau endpoint provider privat).
     pub flashblocks_endpoint: Option<String>,
+    /// Endpoint Envio HyperSync untuk pengganti eth_getLogs (baca event log).
+    /// Default: "https://base.hypersync.xyz". HyperSync TIDAK memakai RPC
+    /// eth_getLogs sehingga tidak terkena pembatasan free-tier RPC.
+    #[serde(default = "default_hypersync_url")]
+    pub hypersync_url: String,
+    /// API token Envio HyperSync (dari dashboard Envio / env ENVIO_API_TOKEN).
+    #[serde(default)]
+    pub hypersync_token: String,
     /// Optional: whitelist alamat ChainlinkOEVWrapper yang diperiksa untuk event
     /// UpdatedPrices. Bila kosong, trigger OEV di-nonaktifkan (selalu false).
     #[serde(default)]
@@ -171,6 +179,9 @@ impl Config {
     }
 }
 
+fn default_hypersync_url() -> String {
+    "https://base.hypersync.xyz".into()
+}
 fn default_max_position() -> u64 {
     25_000
 }

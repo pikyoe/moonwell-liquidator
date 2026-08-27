@@ -1,6 +1,7 @@
 mod config;
 mod contracts;
 mod health;
+mod hypersync;
 mod indexer;
 mod state;
 mod strategy;
@@ -87,7 +88,10 @@ async fn main() -> Result<()> {
         start_block
     };
 
-    let indexer = Indexer::new(http.clone(), state.clone(), cfg.market_addresses()?)
+    // Log event kini dibaca dari Envio HyperSync (alasannya: RPC free-tier
+    // memblokir eth_getLogs). eth_call/username tetap lewat RPC HTTP biasa.
+    let hyper = crate::hypersync::HyperSync::new(&cfg.hypersync_url, &cfg.hypersync_token).await?;
+    let indexer = Indexer::new(http.clone(), hyper, state.clone(), cfg.market_addresses()?)
         .with_refresh_concurrency(cfg.indexer_refresh_concurrency);
     if let Err(e) = indexer.bootstrap_borrowers(start_block).await {
         warn!(?e, "bootstrap gagal — lanjut dengan state kosong");
@@ -192,37 +196,37 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Perbarui posisi semua akun dari event di blok ini.
-            if let Err(e) = indexer.watch_block(number, number).await {
-                warn!(?e, number, "gagal memproses log blok");
-            }
+            // Perbarui posisi semua akun dari event di blok ini + deteksi trigger
+            // OEV (UpdatedPrices), dalam SATU kueri HyperSync. Nilai kembalian
+            // `true` berarti ada trigger OEV pada blok ini.
+            let oev_trigger = match indexer.watch_block(number, number, &oev_wrappers).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(?e, number, "gagal memproses log blok");
+                    false
+                }
+            };
             last_processed = Some(number);
 
             // Trigger wrapper OEV — scan langsung tanpa perlu menunggu refresh 10-blok.
             // Dijalankan non-blocking: tidak men-stall loop blok menunggu scan.
-            if !oev_wrappers.is_empty() {
-                match indexer.check_price_trigger(number, &oev_wrappers).await {
-                    Ok(true) => {
-                        if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
-                            warn!(?e, "refresh harga saat trigger OEV gagal");
-                        }
-                        let strategy = strategy.clone();
-                        let http = http.clone();
-                        let job_tx = job_tx.clone();
-                        let oev_gate = oev_scan_gate.clone();
-                        tasks.spawn(async move {
-                            // Skip bila scan OEV lain sedang berjalan —
-                            // trigger berikutnya akan di-scan pada blok baru.
-                            let permit = match oev_gate.try_acquire_owned() {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
-                            spawn_scan(strategy, http, job_tx, permit).await;
-                        });
-                    }
-                    Ok(false) => {}
-                    Err(e) => warn!(?e, "cek trigger OEV gagal"),
+            if oev_trigger && !oev_wrappers.is_empty() {
+                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+                    warn!(?e, "refresh harga saat trigger OEV gagal");
                 }
+                let strategy = strategy.clone();
+                let http = http.clone();
+                let job_tx = job_tx.clone();
+                let oev_gate = oev_scan_gate.clone();
+                tasks.spawn(async move {
+                    // Skip bila scan OEV lain sedang berjalan —
+                    // trigger berikutnya akan di-scan pada blok baru.
+                    let permit = match oev_gate.try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    spawn_scan(strategy, http, job_tx, permit).await;
+                });
             }
 
             if number % 10 == 0 {
