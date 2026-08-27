@@ -158,10 +158,16 @@ async fn main() -> Result<()> {
         // agar tidak leak task.
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-        // Pembatas jumlah scan yang berjalan SEIRING — mencegah satu scan per
-        // blok menumpuk dan meledakkan RPC. Snapshot diambil di bawah lock
-        // singkat, evaluasi latar belakang tidak memegang mutex strategy.
+        // Gate scan blok reguler: concurrency-1 dan MEMAKAI try-acquire —
+        // kalau satu scan sudah berjalan, blok ini dilewati (state segar tetap
+        // di-scan pada blok berikutnya), sehingga tidak ada backlog task yang
+        // menumpuk menunggu semaphore. Semua input di-snapshot di bawah lock
+        // singkat; evaluasi tidak memegang mutex strategy.
         let scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        // Gate terpisah untuk scan trigger OEV: jalur OEV yang sensitif-waktu
+        // punya permit sendiri sehingga TIDAK menunggu scan blok reguler
+        // (dan tidak memperebutkan permit yang sama).
+        let oev_scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
 
         // Catat blok terakhir yang diproses agar rentang terlewat
         // (drop WS / lag subscriber) bisa di-replay.
@@ -197,11 +203,13 @@ async fn main() -> Result<()> {
                         let strategy = strategy.clone();
                         let http = http.clone();
                         let job_tx = job_tx.clone();
-                        let scan_gate = scan_gate.clone();
-                        tokio::spawn(async move {
-                            let permit = match scan_gate.acquire_owned().await {
+                        let oev_gate = oev_scan_gate.clone();
+                        tasks.spawn(async move {
+                            // Skip bila scan OEV lain sedang berjalan —
+                            // trigger berikutnya akan di-scan pada blok baru.
+                            let permit = match oev_gate.try_acquire_owned() {
                                 Ok(p) => p,
-                                Err(_) => return, // gate ditutup
+                                Err(_) => return,
                             };
                             spawn_scan(strategy, http, job_tx, permit).await;
                         });
@@ -225,11 +233,14 @@ async fn main() -> Result<()> {
                 let strategy = strategy.clone();
                 let http = http.clone();
                 let job_tx = job_tx.clone();
-                let scan_gate = scan_gate.clone();
-                tokio::spawn(async move {
-                    let permit = match scan_gate.acquire_owned().await {
+                let gate = scan_gate.clone();
+                tasks.spawn(async move {
+                    // Skip bila satu scan reguler sudah berjalan; blok
+                    // berikutnya akan men-scan state yang lebih segar. Ini
+                    // mencegah backlog task redundant menumpuk di semaphore.
+                    let permit = match gate.try_acquire_owned() {
                         Ok(p) => p,
-                        Err(_) => return, // gate ditutup
+                        Err(_) => return,
                     };
                     let job = strategy.lock().await.scan(http);
                     for j in job.run().await {
