@@ -6,11 +6,10 @@ use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
-/// Konkurensi refresh akun per blok — mencegah satu blok ramai membanjiri RPC
-/// dengan snapshot beruntun; cukup besar agar deteksi tetap secepat mungkin.
-const INDEXER_REFRESH_CONCURRENCY: usize = 8;
+
 
 // Event yang mempengaruhi posisi. Kita pantau Mint/Borrow/Repay/Redeem/Transfer.
 alloy::sol! {
@@ -30,11 +29,19 @@ pub struct Indexer<P: Provider> {
     provider: P,
     state: SharedState,
     markets: Vec<Address>,
+    /// Konkurensi refresh akun per blok. Dikurangi bila RPC rentan rate-limit.
+    refresh_concurrency: usize,
 }
 
 impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
     pub fn new(provider: P, state: SharedState, markets: Vec<Address>) -> Self {
-        Self { provider, state, markets }
+        Self { provider, state, markets, refresh_concurrency: 2 }
+    }
+
+    /// Setter untuk konkur¬ensi refresh — di-wheel dari config saat init.
+    pub fn with_refresh_concurrency(mut self, concurrency: usize) -> Self {
+        self.refresh_concurrency = concurrency.max(1);
+        self
     }
 
     /// Bootstrap: scan event Borrow historis untuk menemukan semua borrower aktif.
@@ -48,6 +55,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         // dilewati setelah chunk minimum pun gagal.
         let mut chunk = 50_000u64;
         let mut start = from_block;
+        let mut backoff = Duration::from_millis(1500);
         while start <= latest {
             let end = (start + chunk).min(latest);
             let filter = Filter::new()
@@ -57,6 +65,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                 .to_block(end);
             match self.provider.get_logs(&filter).await {
                 Ok(logs) => {
+                    backoff = Duration::from_millis(1500);
                     for log in logs {
                         if let Ok(ev) = Borrow::decode_log(&log.inner) {
                             let borrower = ev.borrower;
@@ -69,8 +78,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                     }
                     start = end + 1;
                 }
+                // Rate limit (429) — jangan lewati rentang; tidur dulu agar
+                // provider pulih, lalu coba ulang rentang yang sama. Ini
+                // penting agar bootstrap TIDAK melewati blok yang belum di-scan.
+                Err(e) if is_rate_limited(&e) => {
+                    warn!(?e, backoff_ms = backoff.as_millis(), start, end, "rate limit — tidur lalu coba ulang");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
                 Err(e) if chunk > 2_000 => {
                     chunk /= 5;
+                    backoff = Duration::from_millis(1500);
                     warn!(?e, chunk, "get_logs ditolak — perkecil chunk, coba ulang");
                 }
                 Err(e) => {
@@ -160,7 +178,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         // (owned) agar task bisa di-spawn `'static`.
         let provider = self.provider.clone();
         let state = self.state.clone();
-        let sem = Arc::new(tokio::sync::Semaphore::new(INDEXER_REFRESH_CONCURRENCY));
+        let sem = Arc::new(tokio::sync::Semaphore::new(self.refresh_concurrency));
         let mut set = tokio::task::JoinSet::new();
         for (market, account) in pairs {
             let provider = provider.clone();
@@ -204,4 +222,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         let logs = self.provider.get_logs(&filter).await?;
         Ok(!logs.is_empty())
     }
+}
+
+/// Deteksi HTTP 429 (rate limit) dari error transport alloy. Alih-alih
+/// melakukan pattern-match pada enum generik (rapuh antar versi), kita cek
+/// representasi string: 429 / "Too Many Requests" / status 4xx+body.
+fn is_rate_limited(e: &dyn std::fmt::Display) -> bool {
+    let s = e.to_string();
+    s.contains("429")
+        || s.contains("Too Many Requests")
+        || s.contains("rate limit")
+        || s.contains("429 Too Many Requests")
 }

@@ -11,9 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-/// Batas evaluasi borrower paralel dalam satu putaran scan — mencegah saturasi
-/// RPC warm-wallet; cukup besar agar scan banyak borrower tetap cepat.
-const EVAL_CONCURRENCY: usize = 8;
+
 
 /// Parametrisasi generik P hanya untuk kompatibilitas panggilan; strategy
 /// tidak memegang provider sendiri — provider dilewatkan per-panggilan ke
@@ -57,7 +55,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
     /// Evaluasi semua borrower secara paralel (konkurensi terbatas lewat
     /// semaphore) dan kembalikan daftar job likuidasi yang lolos simulasinya.
     pub async fn run(self: &Arc<Self>) -> Vec<LiquidationJob> {
-        let sem = Arc::new(Semaphore::new(EVAL_CONCURRENCY));
+        let sem = Arc::new(Semaphore::new(self.snapshot.cfg.eval_concurrency));
         let mut set = tokio::task::JoinSet::new();
         for borrower in &self.borrowers {
             let borrower = *borrower;

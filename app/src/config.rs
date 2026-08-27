@@ -38,6 +38,23 @@ pub struct Config {
     /// Aktifkan jalur B (classic) sebagai fallback.
     #[serde(default = "default_true")]
     pub classic_fallback: bool,
+    /// Batas jumlah evaluasi borrower paralel dalam satu putaran scan.
+    /// Kecilkan bila provider RPC rentan rate-limit (mis. plan gratis).
+    #[serde(default = "default_eval_concurrency")]
+    pub eval_concurrency: usize,
+    /// Batas refresh akun paralel satu blok (indexer). Kecilkan bila RPC
+    /// rentan rate-limit.
+    #[serde(default = "default_indexer_refresh_concurrency")]
+    pub indexer_refresh_concurrency: usize,
+    /// Batas worker submitter (simulate + send) paralel.
+    #[serde(default = "default_submitter_concurrency")]
+    pub submitter_concurrency: usize,
+    /// Kedalaman blok untuk bootstrap borrower historis (default 2_000).
+    /// Provider tanpa plan Archive (mis. Chainstack default) menolak getLogs
+    /// terlalu ke belakang — kecilkan (mis. 2_000) agar bootstrap berhasil
+    /// pada jendela non-archive lalu bot lanjut live.
+    #[serde(default = "default_bootstrap_depth")]
+    pub bootstrap_depth_blocks: u64,
     /// Swap aktif (opsional). Router & calldata diisi di strategi.
     #[serde(default)]
     pub swap: SwapConfig,
@@ -157,6 +174,18 @@ fn default_max_gas_cost() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_bootstrap_depth() -> u64 {
+    2_000
+}
+fn default_eval_concurrency() -> usize {
+    2
+}
+fn default_indexer_refresh_concurrency() -> usize {
+    2
+}
+fn default_submitter_concurrency() -> usize {
+    2
 }
 
 

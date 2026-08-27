@@ -78,13 +78,17 @@ async fn main() -> Result<()> {
     let initial = loaded.map(|(_, s)| s).unwrap_or_default();
     let state: SharedState = Arc::new(initial);
     let start_block = if start_block == 0 {
-        http.get_block_number().await?.saturating_sub(500_000)
+        http
+            .get_block_number()
+            .await?
+            .saturating_sub(cfg.bootstrap_depth_blocks.max(1))
     } else {
         info!(block = start_block, "snapshot dimuat");
         start_block
     };
 
-    let indexer = Indexer::new(http.clone(), state.clone(), cfg.market_addresses()?);
+    let indexer = Indexer::new(http.clone(), state.clone(), cfg.market_addresses()?)
+        .with_refresh_concurrency(cfg.indexer_refresh_concurrency);
     if let Err(e) = indexer.bootstrap_borrowers(start_block).await {
         warn!(?e, "bootstrap gagal — lanjut dengan state kosong");
     }
@@ -118,11 +122,12 @@ async fn main() -> Result<()> {
     {
         let submitter_t = submitter.clone();
         let classic_fallback = cfg.classic_fallback;
+        let submitter_concurrency = cfg.submitter_concurrency.max(1);
         tokio::spawn(async move {
             futures::stream::unfold(job_rx, |mut rx| async move {
                 rx.recv().await.map(|job| (job, rx))
             })
-            .for_each_concurrent(4, move |job| {
+            .for_each_concurrent(submitter_concurrency, move |job| {
                 let s = submitter_t.clone();
                 let cfb = classic_fallback;
                 async move {
