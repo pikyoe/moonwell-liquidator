@@ -279,19 +279,30 @@ diperbaiki di commit `d2c2d62`:
 2. **Performance — selector scan full runtime code** (`OevLiquidator.sol`)
    `_oevLiquidate` menyalin & memindai seluruh bytecode wrapper per-byte untuk
    selector 0x16bb3b3a — O(codeLen) gas + baca memori melampaui batas salinan.
-   - Fix: scan hanya **256 byte pertama** runtime code (daerah dispatcher
-     selector; terverifikasi on-chain: offset 54 utk wrapper WETH Base) dan
-     memeriksa 8 slot 4-byte. Aggregator raw Chainlink (9.5 KB) di-benchmark:
-     tidak mengandung selector → tetap di-tolak. Panggilan
-     `updatePriceEarlyAndLiquidate` tetap gerbang final.
+   - Fix awal (commit `d2c2d62`): scan hanya **256 byte pertama** runtime code
+     (daerah dispatcher; terverifikasi on-chain: offset 54 utk wrapper WETH
+     Base). Aggregator raw Chainlink (9.5 KB) di-benchmark: tidak mengandung
+     selector → tetap di-tolak. Panggilan `updatePriceEarlyAndLiquidate` tetap
+     gerbang final.
    - Test: `testOevRejectsNonWrapperFeed` — getFeed dip-mock ke aggregator
      raw WETH/USD, `execute` harus revert "wrapper bukan OEV".
+3. **Bug (gitar-bot#3) — bounded scan awal hanya cek offset kelipatan-32**
+   (`OevLiquidator.sol`, commit `89b7297`). Versi 8-slot (0,32,...,224) salah:
+   dispatcher Solidity menaruh selector sebagai PUSH4 pada offset **4-byte
+   aligned**, bukan 32-byte aligned (wrapper produksi punya 0x16bb3b3a di
+   offset 54 → lolos di antara slot). Diganti loop per-byte `i in 0..256`
+   dengan buffer `extcodecopy(…, 288)` (kelipatan 32; zero-fill di luar kode)
+   sehingga `mload(add(ptr, i))` selalu berada dalam buffer yang sah dan
+   `and(…,0xFFFFFFFF)` tidak tertipu byte tetangga.
+   - Test: `testOevDetectsNonAlignedSelector` — bytecode dummy berisi
+     `6316bb3b3a` di offset 54/55 (didahului STOP); filter harus lolos dan
+     eksekusi berlanjut ke call (STOP) → revert "zero seized". Bila scan
+     kelipatan-32, test revert "wrapper bukan OEV" → gagal.
 
-**Verifikasi sesi review (2026-08-27):**
-- `forge test` (Base publik): **15/15 PASS** (14 lama + 1 test baru)
+**Verifikasi sesi review (2026-08-27, final):**
+- `forge test` (Base publik): **16/16 PASS** (14 lama + 2 test baru)
 - `cargo test`: **15/15 PASS** (13 lama + 2 test baru)
 - `cargo clippy --all-targets`: **0 warning**
 
-**Status:** commit `d2c2d62` sudah di-push ke `fix/audit-remediation-2026-08-27`
-(PR #14 otomatis ter-update); ketiga komentar sudah di-reply dengan
-konfirmasi fix. PR masih `open` dan `mergeable: true`.
+**Status:** commit `89b7297` sudah di-push ke `fix/audit-remediation-2026-08-27`
+(PR #14 auto-update); keempat thread review di-resolve, PR di-merge.

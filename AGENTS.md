@@ -1,9 +1,9 @@
 # Moonwell Liquidator — Repo Knowledge
 
 ## Build & Test
-- Kontrak: `cd contracts && forge build && forge test` (fork test ke Base mainnet via `BASE_RPC_URL`, default publik). Semua 15 test harus lulus.
+- Kontrak: `cd contracts && forge build && forge test` (fork test ke Base mainnet via `BASE_RPC_URL`, default publik). Semua 16 test harus lulus.
 - Bot: `cd app && cargo build` (debug) / `cargo build --release`. Jalankan `cargo clippy` sebelum commit.
-- Test fork terakhir diverifikasi: 15/15 PASS (forge, solc 0.8.24), termasuk 2 e2e happy path (borrower dibuat underwater via mockCall oracle; OEV path diuji dengan FakeOevWrapper realistis yang di-etch ke alamat wrapper asli — split 30% ke feeRecipient seperti produksi) + test penolakan aggregator non-wrapper (bounded selector scan).
+- Test fork terakhir diverifikasi: 16/16 PASS (forge, solc 0.8.24), termasuk 2 e2e happy path (borrower dibuat underwater via mockCall oracle; OEV path diuji dengan FakeOevWrapper realistis yang di-etch ke alamat wrapper asli — split 30% ke feeRecipient seperti produksi) + test penolakan aggregator non-wrapper + test deteksi selector offset non-32.
 - Fork test meng-unlock `borrowCaps` (guardian `0x08eD…CF05`) dan me-seed cash mUSDC (10M) karena `getCash(mUSDC)=0` di mainnet — jangan hapus helper itu bila tests E2E mulai revert "borrow gagal".
 - RPC berbayar Chainstack tidak menyediakan archive/data-trace: jalankan fork test dengan `BASE_RPC_URL=https://mainnet.base.org` (publik) untuk blok lama; bisa pin blok via `BASE_FORK_BLOCK`.
 
@@ -38,5 +38,5 @@
 
 ## Review PR #14 (2026-08-27, komentar reviewer difix & diverifikasi)
 - Fallback OEV->Classic TIDAK boleh hanya membalik `job.mode`: swapData/minLoanOut/minProfit dibangun ulang utk mode Classic via `Strategy::rebuild_classic_job` (Classic men-redeem seluruh sitaan = 100% profit, bukan split OEV 30%). Logika swap di free fn `build_swap_parts` (dipakai evaluator & rebuild).
-- Selector OEV `0x16bb3b3a` discan cukup di 256 byte pertama runtime code wrapper (daerah dispatcher; verified offset 54 utk wrapper WETH Base) — bukan seluruh bytecode.
-- Verifikasi akhir: forge 15/15 PASS, cargo 15/15 PASS, clippy 0 warning.
+- Selector OEV `0x16bb3b3a` discan cukup di 256 byte pertama runtime code wrapper (daerah dispatcher; verified offset 54 utk wrapper WETH Base) — bukan seluruh bytecode. Scan per-byte (dispatcher Solidity memakai PUSH4 offset 4-byte-aligned, bukan 32-byte-aligned — gitar-bot#3). Buffer copy 288B agar mload aman.
+- Verifikasi akhir: forge 16/16 PASS, cargo 15/15 PASS, clippy 0 warning.
