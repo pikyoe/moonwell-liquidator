@@ -41,14 +41,42 @@ pub struct HyperSync {
 
 impl HyperSync {
     pub async fn new(url: &str, token: &str) -> anyhow::Result<Self> {
-        let mut builder = Client::builder().url(url);
-        if !token.is_empty() {
-            builder = builder.api_token(token);
+        // Token wajib sejak Nov 2025. Tolak cepat bila kosong sehingga bot
+        // TIDAK berjalan sebagai silent no-op (tanpa pelacakan posisi/OEV).
+        if token.trim().is_empty() {
+            anyhow::bail!(
+                "hypersync_token wajib diisi (wajib sejak Nov 2025). \
+                 Buat token di dashboard Envio dan isi di config `hypersync_token` \
+                 atau env ENVIO_API_TOKEN. Endpoint: {url}"
+            );
         }
-        let client = builder
+        let client = Client::builder()
+            .url(url)
+            .api_token(token.to_string())
             .build()
             .map_err(|e| anyhow::anyhow!("gagal init HyperSync client: {e}"))?;
-        Ok(Self { client })
+        let hyper = Self { client };
+        // Verifikasi konektivitas + keabsahan token AKTIF: query blok 0-1.
+        // Gagal di sini => token/URL salah => fail-fast, bukan silent no-op.
+        hyper.ping().await?;
+        Ok(hyper)
+    }
+
+    /// Query minimal (blok 0-1, tanpa filter) untuk memastikan endpoint dan
+    /// token valid. Dipanggil sekali saat startup.
+    async fn ping(&self) -> anyhow::Result<()> {
+        let query = Query::new()
+            .from_block(0)
+            .to_block_excl(1)
+            .where_logs(LogFilter::all())
+            .select_log_fields([LogField::BlockNumber]);
+        let res = self
+            .client
+            .get(&query)
+            .await
+            .map_err(|e| anyhow::anyhow!("verifikasi token HyperSync gagal — periksa hypersync_url/token: {e}"))?;
+        let _ = res.data.logs.len();
+        Ok(())
     }
 
     /// Ambil log dari `addresses` pada rentang [from, to]. Bila `topic0`
@@ -82,6 +110,7 @@ impl HyperSync {
 
         let mut out = Vec::new();
         let mut q = query.to_block_excl(to_excl);
+        let mut prev_from = from;
         loop {
             let res = self.client.get(&q).await?;
             for batch in &res.data.logs {
@@ -95,6 +124,13 @@ impl HyperSync {
             if res.next_block >= to_excl {
                 break;
             }
+            // Guard tanpa-laju: bila HyperSync belum mengindeks tip (blok yang
+            // baru tiba via WS belum tersedia), `next_block` tidak maju melewati
+            // awal rentang. Putus alih-alih busy-loop men-hammer endpoint.
+            if res.next_block <= prev_from {
+                break;
+            }
+            prev_from = res.next_block;
             q = q.clone().from_block(res.next_block);
         }
         Ok(out)
@@ -139,6 +175,7 @@ impl HyperSync {
 
         let mut market_logs: Vec<RpcLog> = Vec::new();
         let mut oev_trigger = false;
+        let mut prev_from = from;
         loop {
             let res = self.client.get(&query).await?;
             for batch in &res.data.logs {
@@ -157,6 +194,11 @@ impl HyperSync {
             if res.next_block >= to_excl {
                 break;
             }
+            // Guard tanpa-laju — lihat get_logs_raw.
+            if res.next_block <= prev_from {
+                break;
+            }
+            prev_from = res.next_block;
             query = query.clone().from_block(res.next_block);
         }
         Ok((market_logs, oev_trigger))
