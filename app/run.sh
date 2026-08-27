@@ -9,11 +9,14 @@
 #   - stop/restart/status via argumen
 #
 # Penggunaan:
-#   ./run.sh            # start (atau tolak bila sudah jalan)
+#   ./run.sh            # start + langsung ikuti log bot (Ctrl+C keluar dari
+#                       #   log, bot tetap berjalan di latar)
 #   ./run.sh start      # sama seperti di atas
+#   ./run.sh start -d   # start tanpa ikuti log (detach)
 #   ./run.sh stop       # hentikan proses (graceful, fallback kill -9)
-#   ./run.sh restart    # stop lalu start
+#   ./run.sh restart    # stop lalu start (ikut log; gunakan `restart -d` utk detach)
 #   ./run.sh status     # status + identitas + log terakhir
+#   ./run.sh logs       # ikuti log bot (tail -f bot.log)
 
 set -euo pipefail
 
@@ -57,6 +60,14 @@ rotate_logs() {
 }
 
 start() {
+  local detach=0
+  # Ambil opsi -d/--detach bila ada (bisa di posisi mana pun).
+  for arg in "$@"; do
+    case "$arg" in
+      -d|--detach) detach=1 ;;
+    esac
+  done
+
   if [ ! -x "$BIN" ]; then
     echo "Binary tidak ditemukan: $BIN"
     echo "Jalankan dulu: cargo build --release"
@@ -87,9 +98,16 @@ start() {
   rotate_logs
   nohup "$BIN" >>"$LOG" 2>&1 9<&- &
   echo $! >"$PIDFILE"
-  echo "Bot dimulai. PID=$(cat "$PIDFILE")"
-  echo "Log: $LOG (ikuti dengan: tail -f $LOG)"
   trap - EXIT                   # sukses — lepas trap bersih-bersih
+
+  echo "Bot dimulai. PID=$(cat "$PIDFILE")"
+  if [ "$detach" -eq 1 ]; then
+    echo "Mode detach — log: $LOG (ikuti dengan: ./run.sh logs)"
+  else
+    echo "Menampilkan log (Ctrl+C untuk keluar; bot tetap berjalan)."
+    echo "Log: $LOG"
+    tail -f "$LOG"
+  fi
 }
 
 stop() {
@@ -133,9 +151,11 @@ status() {
 }
 
 case "${1:-start}" in
-  start)    start ;;
+  start)    start "${@:2}" ;;
   stop)     stop ;;
-  restart)  stop; start ;;
+  restart)  stop; start "${@:2}" ;;
   status)   status ;;
+  logs)     [ -f "$LOG" ] || { echo "Belum ada log: $LOG"; exit 1; }
+            tail -f "$LOG" ;;
   *)        echo "Argumen tidak dikenal: $1 (lihat atas file)"; exit 1 ;;
 esac
