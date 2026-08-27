@@ -256,3 +256,42 @@ Semua temuan alamat-fix diselesaikan dan diverifikasi. Ringkasan per temuan:
 - Private key plaintext di `config.toml` (dokumentasi keamanan; di luar lingkup hook repo).
 - `deadline` swap 600 detik tidak di-enforce di kontrak (lihat #8).
 - `min_profit_wei` default `"0"` tetap memungkinkan likuidasi profit-nol **bila operator tidak mengisi** `[min_profit_per_symbol]`; disarankan set nilai nyata di config produksi.
+
+# Review PR #14 — remediasi komentar reviewer (2026-08-27, sesi lanjutan)
+
+PR #14 (`fix/audit-remediation-2026-08-27`) mendapat 3 komentar review (2 dari
+`gitar-bot[bot]`, 1 dari `devin-ai-integration[bot]`). Ketiganya benar dan sudah
+diperbaiki di commit `d2c2d62`:
+
+1. **Bug — Classic fallback memakai swap param OEV** (`app/src/main.rs`)
+   Sebelumnya fallback OEV→Classic hanya membalik `jb.mode`, mempertahankan
+   `swapData`/`minLoanOut`/`minProfit` hasil `build_swap` untuk mode OEV
+   (amountIn = repay + 30% profit). Padahal di mode Classic kontrak men-redeem
+   SELURUH sitaan (repay + 100% profit) — calldata swap kekurangan aset dan
+   profit terukur jatuh di bawah minProfit.
+   - Fix: `Strategy::rebuild_classic_job(&job)` menghitung ulang
+     `swapData`/`minLoanOut`/`minProfit` untuk mode Classic sebelum retry.
+     Logika swap diekstrak dari method `ScanJob` ke free fn `build_swap_parts`
+     sehingga dipakai evaluator maupun rebuild. Bila market loan/kolateral
+     tidak dimuat, fallback di-skip (tidak mengirim swap basi).
+   - Test: `strategy::tests::rebuild_classic_amount_in_lebih_besar_dari_oev`
+     memverifikasi minLoanOut Classic > OEV; test swap-nonaktif.
+2. **Performance — selector scan full runtime code** (`OevLiquidator.sol`)
+   `_oevLiquidate` menyalin & memindai seluruh bytecode wrapper per-byte untuk
+   selector 0x16bb3b3a — O(codeLen) gas + baca memori melampaui batas salinan.
+   - Fix: scan hanya **256 byte pertama** runtime code (daerah dispatcher
+     selector; terverifikasi on-chain: offset 54 utk wrapper WETH Base) dan
+     memeriksa 8 slot 4-byte. Aggregator raw Chainlink (9.5 KB) di-benchmark:
+     tidak mengandung selector → tetap di-tolak. Panggilan
+     `updatePriceEarlyAndLiquidate` tetap gerbang final.
+   - Test: `testOevRejectsNonWrapperFeed` — getFeed dip-mock ke aggregator
+     raw WETH/USD, `execute` harus revert "wrapper bukan OEV".
+
+**Verifikasi sesi review (2026-08-27):**
+- `forge test` (Base publik): **15/15 PASS** (14 lama + 1 test baru)
+- `cargo test`: **15/15 PASS** (13 lama + 2 test baru)
+- `cargo clippy --all-targets`: **0 warning**
+
+**Status:** commit `d2c2d62` sudah di-push ke `fix/audit-remediation-2026-08-27`
+(PR #14 otomatis ter-update); ketiga komentar sudah di-reply dengan
+konfirmasi fix. PR masih `open` dan `mergeable: true`.
