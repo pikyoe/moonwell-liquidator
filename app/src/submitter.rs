@@ -34,6 +34,9 @@ pub struct Submitter {
     /// Batas biaya gas per tx (wei ETH). Simulasi profit yang lolos tetap
     /// bisa rugi bersih bila gas mahal — tx di atas batas ini tidak dikirim.
     max_gas_cost: U256,
+    /// Mode dry-run: simulasi eth_call + estimasi gas tetap dijalankan, tapi
+    /// transaksi tidak dikirim. Dipakai untuk analisa perilaku tanpa dana.
+    dry_run: bool,
 }
 
 /// RAII guard: hapus key dedup saat scope submit berakhir (sukses maupun error).
@@ -55,6 +58,7 @@ impl Submitter {
         executor: Address,
         flashblocks_endpoint: Option<Url>,
         max_gas_cost: U256,
+        dry_run: bool,
     ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer);
         let provider = ProviderBuilder::new()
@@ -66,7 +70,7 @@ impl Submitter {
             ProviderBuilder::new().wallet(wallet).connect_http(url)
         });
 
-        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()), max_gas_cost })
+        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()), max_gas_cost, dry_run })
     }
 
     /// Simulasi dulu; kalau lolos baru kirim transaksi nyata.
@@ -116,8 +120,15 @@ impl Submitter {
             }
         }
 
-        // 3. Kirim. Bila ada provider flashblocks, kirim lewat endpoint private;
-        //    kalau tidak, mempool publik.
+        // 3. Kirim — KECUALI mode dry_run: simulasi & guard gas tetap jalan,
+        //    tapi tidak ada tx yang dikirim (hanya lapor bahwa job siap kirim).
+        if self.dry_run {
+            info!("dry-run: simulasi lolos, tx TIDAK dikirim");
+            return Ok(());
+        }
+
+        // Bila ada provider flashblocks, kirim lewat endpoint private;
+        // kalau tidak, mempool publik.
         match self.flashblocks {
             Some(ref fb_provider) => {
                 let fb_contract = IOevLiquidator::new(self.executor, fb_provider);

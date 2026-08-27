@@ -38,6 +38,11 @@ pub struct Config {
     /// Aktifkan jalur B (classic) sebagai fallback.
     #[serde(default = "default_true")]
     pub classic_fallback: bool,
+    /// Mode kering (dry-run): simulasi eth_call + estimasi gas tetap dijalankan,
+    /// TAPI transaksi TIDAK dikirim. Berguna untuk analisa perilaku deteksi &
+    /// simulasi tanpa mempertaruhkan dana. Default false.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Batas jumlah evaluasi borrower paralel dalam satu putaran scan.
     /// Kecilkan bila provider RPC rentan rate-limit (mis. plan gratis).
     #[serde(default = "default_eval_concurrency")]
@@ -192,6 +197,28 @@ fn default_submitter_concurrency() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_run_default_false() {
+        let cfg = base_cfg("1000");
+        assert!(!cfg.dry_run);
+    }
+
+    #[test]
+    fn dry_run_dapat_diaktifkan() {
+        let cfg: Config = toml::from_str(
+            r#"
+base_rpc_http = "https://x"
+base_rpc_ws = "wss://x"
+private_key = "0x"
+executor_address = "0x0000000000000000000000000000000000000001"
+min_profit_wei = "1000"
+dry_run = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg.dry_run);
+    }
 
     fn base_cfg(min_profit_wei: &str) -> Config {
         toml::from_str(&format!(

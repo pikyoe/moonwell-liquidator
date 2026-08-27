@@ -108,6 +108,7 @@ async fn main() -> Result<()> {
             executor,
             cfg.flashblocks_endpoint.as_ref().map(|u| u.parse()).transpose()?,
             cfg.max_gas_cost()?,
+            cfg.dry_run,
         )
         .await?,
     );

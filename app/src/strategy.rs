@@ -9,7 +9,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 
 
@@ -101,10 +101,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             return Ok(None);
         }
 
-        // pilih market pinjaman terbesar sebagai target repay,
-        // dan market kolateral terbesar sebagai sumber sitaan.
+        // pilih market pinjaman terbesar sebagai target repay.
         let mut best_loan: Option<(Address, U256)> = None;
-        let mut best_coll: Option<(Address, U256)> = None;
         for m in positions.iter() {
             let market = *m.key();
             let Some(info) = snap.markets.get(&market) else { continue };
@@ -114,6 +112,24 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                     best_loan = Some((market, m.borrow_balance));
                 }
             }
+        }
+        let (mloan, _stale_borrow) = match best_loan {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+
+        // Pilih market kolateral terbesar sebagai sumber sitaan, DENGAN syarat
+        // market-nya BERBEDA dari mloan. Likuidasi dengan mloan == mcoll selalu
+        // revert (wrapper mencoba men-seize kolateral dari market pinjaman itu
+        // sendiri) — sebelumnya best_loan & best_coll bisa jatuh di market yang
+        // sama, menghasilkan peluang yang pasti gagal.
+        let mut best_coll: Option<(Address, U256)> = None;
+        for m in positions.iter() {
+            let market = *m.key();
+            if market == mloan {
+                continue;
+            }
+            let Some(info) = snap.markets.get(&market) else { continue };
             if m.mtoken_balance > U256::ZERO {
                 let v = info.collateral_value_usd(m.mtoken_balance, m.exchange_rate);
                 if best_coll.as_ref().map(|(_, bv)| v > *bv).unwrap_or(true) {
@@ -121,14 +137,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                 }
             }
         }
-
-        let (mloan, _stale_borrow) = match best_loan {
-            Some(x) => x,
-            None => return Ok(None),
-        };
         let (mcoll, _) = match best_coll {
             Some(x) => x,
-            None => return Ok(None),
+            None => {
+                // Tak ada kolateral di market selain mloan → tidak bisa
+                // dilikuidasi secara valid.
+                debug!(
+                    ?mloan,
+                    "tidak ada kolateral berbeda dari market pinjaman — skip"
+                );
+                return Ok(None);
+            }
         };
         // Lepaskan read guard pada map positions SEBELUM upsert() — upsert
         // mengambil write lock pada shard yang sama; menahannya di sini akan
@@ -215,7 +234,15 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             minLoanOut: min_loan_out,
         };
 
-        info!(?borrower, ?mloan, ?mcoll, %repay, "peluang terdeteksi");
+        info!(
+            ?borrower,
+            ?mloan,
+            ?mcoll,
+            loan_symbol = %loan_info.symbol,
+            coll_symbol = %coll_info.symbol,
+            %repay,
+            "peluang terdeteksi"
+        );
         Ok(Some(job))
     }
 
