@@ -242,6 +242,25 @@ contract OevLiquidatorTest is Test {
         assertTrue(wrapper != address(0), "wrapper WETH harus terdaftar");
     }
 
+    /// Feed jalur OEV yang bukan ChainlinkOEVWrapper (aggregator raw) harus
+    /// di-tolak oleh penyaring selector 0x16bb3b3a — bukan revert acak dari
+    /// memanggil fungsi yang tidak ada di aggregator.
+    function testOevRejectsNonWrapperFeed() public {
+        // Borower nyata diperlukan agar repayAmount > 0 (execute nihil saat 0).
+        address borrower = _createUnderwaterBorrower();
+        // Samakan getFeed("WETH") dengan aggregator raw Chainlink
+        // (WETH/USD 0x7104..) yang tidak punya updatePriceEarlyAndLiquidate.
+        address rawAgg = 0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70;
+        vm.mockCall(
+            ORACLE,
+            abi.encodeWithSelector(IOracle.getFeed.selector, "WETH"),
+            abi.encode(rawAgg)
+        );
+        LiquidationJob memory job = _buildJob(Mode.Oev, borrower);
+        vm.expectRevert("wrapper bukan OEV");
+        executor.execute(job);
+    }
+
     /// Simulasi jalur OEV penuh memerlukan borrower underwater pada state fork.
     /// Tanpa data historis, kita pastikan eth_call revert terkontrol.
     /// Wrapper mungkin revert duluan karena flashloan tidak bisa dikembalikan

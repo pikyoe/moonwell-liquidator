@@ -213,33 +213,42 @@ contract OevLiquidator {
         IOracle oracle = IOracle(comptroller.oracle());
         address wrapper = oracle.getFeed(IERC20Symbol(address(collateralUnderlying)).symbol());
 
-        // Wrapper yang sah harus punya fungsi updatePriceEarlyAndLiquidate.
-        // Untuk feed yang bukan ChainlinkOEVWrapper (mis. aggregator Chainlink
-        // biasa seperti wstETH/rETH/weETH) panggilan berikut akan revert — bot
-        // off-chain sudah memilih Mode::Classic untuk kasus tersebut, tapi
-        // kontrak juga mem-forward-fault dengan pesan yang jelas.
+        // Penyaring murah: wrapper yang sah harus punya kode DAN selector
+        // updatePriceEarlyAndLiquidate (0x16bb3b3a) di dispatcher — selalu di
+        // 256 byte pertama runtime code (terverifikasi on-chain: offset 54 utk
+        // wrapper WETH Base). Feed non-OEV (aggregator Chainlink wstETH/rETH/
+        // weETH, panjang 9.5 KB) tak punya selector ini. Panggilan berikutnya
+        // tetap gerbang final: wrapper yang meloloskan diri akan revert dengan
+        // pesan jelas dari memanggil fungsi yang tidak ada.
         require(
             wrapper != address(0) && wrapper.code.length > 0,
             "no wrapper"
         );
-
         bool hasFn = false;
         assembly {
-            // Scan seluruh runtime code untuk 4-byte selector
-            // 0x16bb3b3a (updatePriceEarlyAndLiquidate) di offset mana pun —
-            // selector ikut termuat ke memori bersama bytecode.
-            let codeLen := extcodesize(wrapper)
+            // 256 byte pertama runtime code; extcodecopy di luar batas zero-fill.
             let ptr := mload(0x40)
-            extcodecopy(wrapper, ptr, 0, codeLen)
-            for { let i := 0 } lt(i, codeLen) { i := add(i, 1) } {
-                // baca 4 byte pada offset i
-                let word := mload(add(ptr, i))
-                let sel := shr(224, word)
-                if eq(sel, 0x16bb3b3a) {
-                    hasFn := 1
-                    break
-                }
-            }
+            extcodecopy(wrapper, ptr, 0, 256)
+            // 8 kemungkinan posisi selector beroffset 4-byte (dispatcher
+            // menyimpannya selebar 32 byte). Cukup 8 slot untuk 256 byte.
+            let s0 := shr(224, mload(ptr))
+            let s1 := shr(224, mload(add(ptr, 32)))
+            let s2 := shr(224, mload(add(ptr, 64)))
+            let s3 := shr(224, mload(add(ptr, 96)))
+            let s4 := shr(224, mload(add(ptr, 128)))
+            let s5 := shr(224, mload(add(ptr, 160)))
+            let s6 := shr(224, mload(add(ptr, 192)))
+            let s7 := shr(224, mload(add(ptr, 224)))
+            hasFn := or(
+                or(
+                    or(eq(s0, 0x16bb3b3a), eq(s1, 0x16bb3b3a)),
+                    or(eq(s2, 0x16bb3b3a), eq(s3, 0x16bb3b3a))
+                ),
+                or(
+                    or(eq(s4, 0x16bb3b3a), eq(s5, 0x16bb3b3a)),
+                    or(eq(s6, 0x16bb3b3a), eq(s7, 0x16bb3b3a))
+                )
+            )
         }
         require(hasFn, "wrapper bukan OEV");
 
