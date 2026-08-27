@@ -5,7 +5,12 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
+use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Konkurensi refresh akun per blok — mencegah satu blok ramai membanjiri RPC
+/// dengan snapshot beruntun; cukup besar agar deteksi tetap secepat mungkin.
+const INDEXER_REFRESH_CONCURRENCY: usize = 8;
 
 // Event yang mempengaruhi posisi. Kita pantau Mint/Borrow/Repay/Redeem/Transfer.
 alloy::sol! {
@@ -27,7 +32,7 @@ pub struct Indexer<P: Provider> {
     markets: Vec<Address>,
 }
 
-impl<P: Provider + Clone> Indexer<P> {
+impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
     pub fn new(provider: P, state: SharedState, markets: Vec<Address>) -> Self {
         Self { provider, state, markets }
     }
@@ -103,12 +108,23 @@ impl<P: Provider + Clone> Indexer<P> {
 
     /// Handler satu blok / rentang blok. Dipanggil per blok di main loop dan juga
     /// untuk mem-replay rentang yang terlewat saat reconnect WS.
+    /// Semua refresh akun dijalankan PARALEL (konkurensi terbatas) agar satu
+    /// blok ramai tidak menambahkan latensi RPC beruntun pada jalur kritis
+    /// deteksi. Dedup per (market, akun) dilakukan sebelum refresh.
     pub async fn watch_block(&self, from_block: u64, to_block: u64) -> Result<()> {
         let filter = Filter::new()
             .address(self.markets.clone())
             .from_block(from_block)
             .to_block(to_block);
         let logs = self.provider.get_logs(&filter).await?;
+        self.process_logs(logs).await
+    }
+
+    /// Jalankan refresh akun untuk semua event di dalam daftar log, paralel.
+    async fn process_logs(&self, logs: Vec<alloy::rpc::types::Log>) -> Result<()> {
+        // Akumulasi (market, account) unik — satu akun bisa terlibat >1 event
+        // dalam satu blok; cukup satu refresh per (market, akun).
+        let mut pairs = Vec::new();
         for log in logs {
             let market = log.address();
             let topics = log.topics();
@@ -116,24 +132,57 @@ impl<P: Provider + Clone> Indexer<P> {
                 if let Ok(ev) = Transfer::decode_log(&log.inner) {
                     // Mint/burn menghasilkan transfer dengan alamat nol — jangan refresh.
                     if ev.from != Address::ZERO {
-                        let _ = self.refresh_account(market, ev.from).await;
+                        pairs.push((market, ev.from));
                     }
                     if ev.to != Address::ZERO {
-                        let _ = self.refresh_account(market, ev.to).await;
+                        pairs.push((market, ev.to));
                     }
                 }
             } else if let Ok(ev) = Mint::decode_log(&log.inner) {
-                let _ = self.refresh_account(market, ev.minter).await;
+                pairs.push((market, ev.minter));
             } else if let Ok(ev) = Redeem::decode_log(&log.inner) {
-                let _ = self.refresh_account(market, ev.redeemer).await;
+                pairs.push((market, ev.redeemer));
             } else if let Ok(ev) = Borrow::decode_log(&log.inner) {
-                let _ = self.refresh_account(market, ev.borrower).await;
+                pairs.push((market, ev.borrower));
             } else if let Ok(ev) = RepayBorrow::decode_log(&log.inner) {
-                let _ = self.refresh_account(market, ev.borrower).await;
+                pairs.push((market, ev.borrower));
             } else if let Ok(ev) = LiquidateBorrow::decode_log(&log.inner) {
-                let _ = self.refresh_account(market, ev.borrower).await;
+                pairs.push((market, ev.borrower));
             }
         }
+
+        // Dedup: cukup satu refresh per (market, akun) per blok.
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        // Refresh paralel dengan konkur¬ensi terbatas — hindari saturasi RPC
+        // saat satu blok men-trigger banyak akun. Provider & state di-clone
+        // (owned) agar task bisa di-spawn `'static`.
+        let provider = self.provider.clone();
+        let state = self.state.clone();
+        let sem = Arc::new(tokio::sync::Semaphore::new(INDEXER_REFRESH_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for (market, account) in pairs {
+            let provider = provider.clone();
+            let state = state.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                let m = IMToken::new(market, &provider);
+                if let Ok(snap) = m.getAccountSnapshot(account).call().await {
+                    state.upsert(
+                        account,
+                        market,
+                        crate::state::Position {
+                            mtoken_balance: snap.mTokenBalance,
+                            borrow_balance: snap.borrowBalance,
+                            exchange_rate: snap.exchangeRateMantissa,
+                        },
+                    );
+                }
+            });
+        }
+        while (set.join_next().await).is_some() {}
         Ok(())
     }
 

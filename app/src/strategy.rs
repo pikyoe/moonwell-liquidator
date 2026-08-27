@@ -1,16 +1,25 @@
 use crate::config::Config;
 use crate::contracts::{IComptroller, IMToken, LiquidationJob, Mode, COMPTROLLER};
 use crate::health::{classify, health_factor, Health, MarketInfo};
-use crate::state::SharedState;
+use crate::state::{Position, SharedState};
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-pub struct Strategy<P: Provider> {
-    provider: P,
+/// Batas evaluasi borrower paralel dalam satu putaran scan — mencegah saturasi
+/// RPC warm-wallet; cukup besar agar scan banyak borrower tetap cepat.
+const EVAL_CONCURRENCY: usize = 8;
+
+/// Parametrisasi generik P hanya untuk kompatibilitas panggilan; strategy
+/// tidak memegang provider sendiri — provider dilewatkan per-panggilan ke
+/// `scan()` agar ScanJob bisa di-spawn sebagai task owned ('static).
+pub struct Strategy<P> {
+    _provider: std::marker::PhantomData<P>,
     state: SharedState,
     cfg: Config,
     markets: HashMap<Address, MarketInfo>,
@@ -21,48 +30,66 @@ pub struct Strategy<P: Provider> {
     liquidation_incentive: U256,
 }
 
-impl<P: Provider + Clone> Strategy<P> {
-    pub fn new(
-        provider: P,
-        state: SharedState,
-        cfg: Config,
-        markets: HashMap<Address, MarketInfo>,
-    ) -> Result<Self> {
-        let executor = cfg.executor_address()?;
-        // 0 bila belum di-refresh — evaluate() akan skip sampai ada nilai.
-        Ok(Self {
-            provider,
-            state,
-            cfg,
-            markets,
-            executor,
-            close_factor: U256::ZERO,
-            liquidation_incentive: U256::ZERO,
-        })
-    }
+/// Rekaman SEMUA input yang dibaca selama evaluasi peluang, disalin ke sini
+/// DI BAWAH lock singkat (murni memori, tanpa await). Evaluasi berikutnya
+/// berjalan tanpa memegang mutex strategy — jadi scan blok reguler tidak
+/// men-stall scan trigger OEV, dan sebaliknya.
+struct ScanSnapshot {
+    state: SharedState,
+    cfg: Config,
+    markets: HashMap<Address, MarketInfo>,
+    executor: Address,
+    close_factor: U256,
+    liquidation_incentive: U256,
+}
 
-    /// Panggilan satu kali dari refresh_prices: muat close factor &
-    /// liquidation incentive dari comptroller — jangan di-hardcode.
-    pub fn update_comptroller_params(&mut self, close_factor: U256, incentive: U256) {
-        self.close_factor = close_factor;
-        self.liquidation_incentive = incentive;
-    }
+/// Job ber-own untuk satu putaran scan: daftar borrower + semua data yang
+/// dibutuhkan untuk membangun peluang, plus provider untuk query state segar.
+/// Send + 'static => bisa di-spawn dan dijalankan paralel dengan scan lain
+/// (mis. scan blok reguler dan scan trigger OEV berjalan bersamaan).
+pub struct ScanJob<P: Provider + Clone> {
+    snapshot: ScanSnapshot,
+    provider: P,
+    borrowers: Vec<Address>,
+}
 
-    /// Evaluasi semua borrower; kembalikan job yang lolos simulasi profit.
-    pub async fn scan_opportunities(&self) -> Result<Vec<LiquidationJob>> {
+impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
+    /// Evaluasi semua borrower secara paralel (konkurensi terbatas lewat
+    /// semaphore) dan kembalikan daftar job likuidasi yang lolos simulasinya.
+    pub async fn run(self: &Arc<Self>) -> Vec<LiquidationJob> {
+        let sem = Arc::new(Semaphore::new(EVAL_CONCURRENCY));
+        let mut set = tokio::task::JoinSet::new();
+        for borrower in &self.borrowers {
+            let borrower = *borrower;
+            let me = self.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                match me.evaluate(borrower).await {
+                    Ok(Some(job)) => Some(job),
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(?borrower, ?e, "evaluasi gagal");
+                        None
+                    }
+                }
+            });
+        }
         let mut jobs = Vec::new();
-        for borrower in self.state.borrowers() {
-            match self.evaluate(borrower).await {
-                Ok(Some(job)) => jobs.push(job),
-                Ok(None) => {}
-                Err(e) => warn!(?borrower, ?e, "evaluasi gagal"),
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(job)) = res {
+                jobs.push(job);
             }
         }
-        Ok(jobs)
+        jobs
     }
 
+    /// Bangun satu LiquidationJob untuk satu borrower bila posisinya sehat
+    /// untuk dilikuidasi OEV. Tidak memegang mutex strategy — semua input
+    /// dibaca dari `self.snapshot` (cloned) dan state DashMap (aman konkuren).
     async fn evaluate(&self, borrower: Address) -> Result<Option<LiquidationJob>> {
-        let Some(positions) = self.state.positions.get(&borrower) else {
+        let snap = &self.snapshot;
+        let Some(positions) = snap.state.positions.get(&borrower) else {
             return Ok(None);
         };
 
@@ -71,7 +98,7 @@ impl<P: Provider + Clone> Strategy<P> {
         for m in positions.iter() {
             tuples.push((*m.key(), m.mtoken_balance, m.borrow_balance, m.exchange_rate));
         }
-        let (_, _, hf) = health_factor(&tuples, &self.markets);
+        let (_, _, hf) = health_factor(&tuples, &snap.markets);
         if classify(hf) != Health::Liquidatable {
             return Ok(None);
         }
@@ -82,7 +109,7 @@ impl<P: Provider + Clone> Strategy<P> {
         let mut best_coll: Option<(Address, U256)> = None;
         for m in positions.iter() {
             let market = *m.key();
-            let Some(info) = self.markets.get(&market) else { continue };
+            let Some(info) = snap.markets.get(&market) else { continue };
             if m.borrow_balance > U256::ZERO {
                 let v = info.borrow_value_usd(m.borrow_balance);
                 if best_loan.as_ref().map(|(_, bv)| v > *bv).unwrap_or(true) {
@@ -113,15 +140,12 @@ impl<P: Provider + Clone> Strategy<P> {
         // Refresh posisi kandidat di kedua market — snapshot state bisa basi
         // (bunga terakru, likuidasi lain). Bangun job dari data segar.
         for market in [mloan, mcoll] {
-            let snap = IMToken::new(market, &self.provider)
-                .getAccountSnapshot(borrower)
-                .call()
-                .await;
-            match snap {
-                Ok(s) => self.state.upsert(
+            let mtoken = IMToken::new(market, &self.provider);
+            match mtoken.getAccountSnapshot(borrower).call().await {
+                Ok(s) => snap.state.upsert(
                     borrower,
                     market,
-                    crate::state::Position {
+                    Position {
                         mtoken_balance: s.mTokenBalance,
                         borrow_balance: s.borrowBalance,
                         exchange_rate: s.exchangeRateMantissa,
@@ -134,7 +158,7 @@ impl<P: Provider + Clone> Strategy<P> {
             }
         }
         let (borrow_bal, coll_bal) = {
-            let Some(pos) = self.state.positions.get(&borrower) else { return Ok(None) };
+            let Some(pos) = snap.state.positions.get(&borrower) else { return Ok(None) };
             let borrow = pos.get(&mloan).map(|p| p.borrow_balance).unwrap_or(U256::ZERO);
             let coll = pos.get(&mcoll).map(|p| p.mtoken_balance).unwrap_or(U256::ZERO);
             (borrow, coll)
@@ -155,21 +179,21 @@ impl<P: Provider + Clone> Strategy<P> {
 
         // batasi repay <= close factor * borrow, dan <= max posisi.
         // Keluar sampai comptroller params sudah dimuat (hindari repay 0/terlalu besar).
-        if self.close_factor.is_zero() {
+        if snap.close_factor.is_zero() {
             return Ok(None);
         }
-        let mut repay = borrow_bal * self.close_factor / U256::from(10u64.pow(18));
-        repay = self.cap_by_max_position(mloan, repay).await?;
+        let mut repay = borrow_bal * snap.close_factor / U256::from(10u64.pow(18));
+        repay = self.cap_by_max_position(snap, mloan, repay).await?;
 
-        let loan_info = self.markets.get(&mloan).cloned();
-        let coll_info = self.markets.get(&mcoll).cloned();
+        let loan_info = snap.markets.get(&mloan).cloned();
+        let coll_info = snap.markets.get(&mcoll).cloned();
         let (Some(loan_info), Some(coll_info)) = (loan_info, coll_info) else {
             return Ok(None);
         };
 
         // Bangun parameter swap (kalau diaktifkan dan asetnya beda).
         let (swap_target, swap_data, min_loan_out) =
-            self.build_swap(&loan_info, &coll_info, repay)?;
+            self.build_swap(snap, &loan_info, &coll_info, repay)?;
 
         // Kontrak mengukur profit di token hasil akhir: loan token bila swap
         // aktif, kolateral bila tidak. Ambil ambang per simbol agar desimal
@@ -189,7 +213,7 @@ impl<P: Provider + Clone> Strategy<P> {
             mTokenCollateral: mcoll,
             borrower,
             repayAmount: repay,
-            minProfit: self.cfg.min_profit_for_symbol(output_symbol)?,
+            minProfit: snap.cfg.min_profit_for_symbol(output_symbol)?,
             minLoanOut: min_loan_out,
         };
 
@@ -202,12 +226,13 @@ impl<P: Provider + Clone> Strategy<P> {
     /// Jika swap nonaktif atau aset sama: (ZERO, kosong, 0).
     fn build_swap(
         &self,
+        snap: &ScanSnapshot,
         loan: &MarketInfo,
         coll: &MarketInfo,
         repay: U256,
     ) -> Result<(Address, alloy::primitives::Bytes, U256)> {
         let zero: alloy::primitives::Bytes = Default::default();
-        if !self.cfg.swap.enabled || loan.underlying == coll.underlying {
+        if !snap.cfg.swap.enabled || loan.underlying == coll.underlying {
             return Ok((Address::ZERO, zero, U256::ZERO));
         }
         if loan.price == U256::ZERO || coll.price == U256::ZERO {
@@ -215,7 +240,7 @@ impl<P: Provider + Clone> Strategy<P> {
         }
 
         // Keluar sampai liquidation incentive sudah dimuat (tak teratur bila 0).
-        if self.liquidation_incentive.is_zero() {
+        if snap.liquidation_incentive.is_zero() {
             return Ok((Address::ZERO, zero.clone(), U256::ZERO));
         }
 
@@ -224,12 +249,12 @@ impl<P: Provider + Clone> Strategy<P> {
         let repay_usd = repay * loan.price / one;
         // Sitaan bruto dikurangi bagian protokol (protocolSeizeShareMantissa) —
         // estimasi tanpa koreksi ini membuat amount_in melebihi saldo aktual.
-        let seized_usd = repay_usd * self.liquidation_incentive / one
+        let seized_usd = repay_usd * snap.liquidation_incentive / one
             * (one - coll.protocol_seize_share) / one;
         let gross_profit_usd = seized_usd.saturating_sub(repay_usd);
         // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000.
         // Fee dibaca on-chain per market bila tersedia; config hanya fallback.
-        let fee_bps = coll.oev_fee_bps.unwrap_or(self.cfg.swap.liquidator_fee_bps);
+        let fee_bps = coll.oev_fee_bps.unwrap_or(snap.cfg.swap.liquidator_fee_bps);
         let liquidator_usd = repay_usd
             + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64);
 
@@ -237,7 +262,7 @@ impl<P: Provider + Clone> Strategy<P> {
         let amount_in = liquidator_usd * one / coll.price;
         let expected_loan_out = liquidator_usd * one / loan.price;
 
-        let min_out = apply_slippage(expected_loan_out, self.cfg.swap.slippage_bps);
+        let min_out = apply_slippage(expected_loan_out, snap.cfg.swap.slippage_bps);
         let deadline = U256::from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -245,10 +270,10 @@ impl<P: Provider + Clone> Strategy<P> {
                 + 600,
         );
 
-        let router: Address = if self.cfg.swap.router.is_empty() {
+        let router: Address = if snap.cfg.swap.router.is_empty() {
             crate::swap::AERODROME_ROUTER.parse()?
         } else {
-            self.cfg.swap.router.parse()?
+            snap.cfg.swap.router.parse()?
         };
 
         let (target, data) = build_aerodrome_swap(crate::swap::SwapParams {
@@ -257,7 +282,7 @@ impl<P: Provider + Clone> Strategy<P> {
             to_token: loan.underlying,
             amount_in,
             amount_out_min: min_out,
-            recipient: self.executor,
+            recipient: snap.executor,
             stable_pair: is_stable_symbol(loan.symbol.as_str())
                 && is_stable_symbol(coll.symbol.as_str()),
             deadline,
@@ -274,20 +299,75 @@ impl<P: Provider + Clone> Strategy<P> {
         Ok((target, data, min_loan_out))
     }
 
-    pub fn update_price(&mut self, mtoken: Address, price: U256) {
-        if let Some(info) = self.markets.get_mut(&mtoken) {
-            info.price = price;
-        }
-    }
-
-    async fn cap_by_max_position(&self, market: Address, repay: U256) -> Result<U256> {
-        let Some(info) = self.markets.get(&market) else { return Ok(repay) };
+    async fn cap_by_max_position(
+        &self,
+        snap: &ScanSnapshot,
+        market: Address,
+        repay: U256,
+    ) -> Result<U256> {
+        let Some(info) = snap.markets.get(&market) else { return Ok(repay) };
         // konversi USD cap ke unit underlying: cap_usd / price * 10^decimals
-        let cap_usd = U256::from(self.cfg.max_position_usd) * U256::from(10u64.pow(18));
+        let cap_usd = U256::from(snap.cfg.max_position_usd) * U256::from(10u64.pow(18));
         if info.price == U256::ZERO {
             return Ok(repay);
         }
         let cap_underlying = cap_usd * U256::from(10u64.pow(18)) / info.price;
         Ok(repay.min(cap_underlying))
+    }
+}
+
+impl<P> Strategy<P> {
+    pub fn new(
+        _provider: P,
+        state: SharedState,
+        cfg: Config,
+        markets: HashMap<Address, MarketInfo>,
+    ) -> Result<Self> {
+        let executor = cfg.executor_address()?;
+        // 0 bila belum di-refresh — evaluate() akan skip sampai ada nilai.
+        Ok(Self {
+            _provider: std::marker::PhantomData,
+            state,
+            cfg,
+            markets,
+            executor,
+            close_factor: U256::ZERO,
+            liquidation_incentive: U256::ZERO,
+        })
+    }
+
+    /// Panggilan satu kali dari refresh_prices: muat close factor &
+    /// liquidation incentive dari comptroller — jangan di-hardcode.
+    pub fn update_comptroller_params(&mut self, close_factor: U256, incentive: U256) {
+        self.close_factor = close_factor;
+        self.liquidation_incentive = incentive;
+    }
+
+    /// Ambil pustaka evaluator DI BAWAH lock singkat lalu lepaskan lock.
+    /// Pemanggil bebas mengevaluasi semua borrower paralel lewat
+    /// `ScanJob::run` — jadi penahan lock tidak lagi mencakup I/O RPC
+    /// (markets/cfg/params di-clone; state dipakai via Arc DashMap).
+    pub fn scan<P2>(&self, provider: P2) -> Arc<ScanJob<P2>>
+    where
+        P2: Provider + Clone + Send + Sync + 'static,
+    {
+        Arc::new(ScanJob {
+            snapshot: ScanSnapshot {
+                state: self.state.clone(),
+                cfg: self.cfg.clone(),
+                markets: self.markets.clone(),
+                executor: self.executor,
+                close_factor: self.close_factor,
+                liquidation_incentive: self.liquidation_incentive,
+            },
+            provider,
+            borrowers: self.state.borrowers(),
+        })
+    }
+
+    pub fn update_price(&mut self, mtoken: Address, price: U256) {
+        if let Some(info) = self.markets.get_mut(&mtoken) {
+            info.price = price;
+        }
     }
 }
