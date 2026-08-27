@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         })
         .collect();
     if !oev_wrappers.is_empty() {
-        info!(count = oev_wrappers.len(), "wrapper OEV dipantau untuk UpdatedPrices");
+        info!(count = oev_wrappers.len(), "wrapper OEV dipantau untuk PriceUpdatedEarlyAndLiquidated");
     }
 
     let markets = build_market_map(&http, &cfg).await?;
@@ -93,8 +93,27 @@ async fn main() -> Result<()> {
     let hyper = crate::hypersync::HyperSync::new(&cfg.hypersync_url, &cfg.hypersync_token).await?;
     let indexer = Indexer::new(http.clone(), hyper, state.clone(), cfg.market_addresses()?)
         .with_refresh_concurrency(cfg.indexer_refresh_concurrency);
-    if let Err(e) = indexer.bootstrap_borrowers(start_block).await {
-        warn!(?e, "bootstrap gagal — lanjut dengan state kosong");
+    // Bootstrap TIDAK boleh gagal-senyap: bot yang mulai dengan daftar borrower
+    // kosong akan berjalan "normal" tapi tidak pernah mendeteksi posisi
+    // underwater yang sudah ada. Coba beberapa kali; kalau tetap gagal, keluar
+    // dengan error (restart/alert alih-alih diam).
+    let mut bootstrap_attempts = 0u32;
+    const MAX_BOOTSTRAP_ATTEMPTS: u32 = 3;
+    loop {
+        match indexer.bootstrap_borrowers(start_block).await {
+            Ok(()) => break,
+            Err(e) => {
+                bootstrap_attempts += 1;
+                warn!(?e, attempt = bootstrap_attempts, "bootstrap borrower gagal");
+                if bootstrap_attempts >= MAX_BOOTSTRAP_ATTEMPTS {
+                    anyhow::bail!(
+                        "bootstrap borrower gagal {bootstrap_attempts}x — berhenti alih-alih \
+                         berjalan dengan state kosong. Cek hypersync_url/token & BASE_RPC_URL."
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     }
 
     let strategy = Arc::new(tokio::sync::Mutex::new(
@@ -105,6 +124,11 @@ async fn main() -> Result<()> {
     if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
         warn!(?e, "refresh harga awal gagal — params akan 0 sampai refresh berikutnya");
     }
+    let priority_fee = if cfg.priority_fee_gwei > 0 {
+        Some(u128::from(cfg.priority_fee_gwei) * 1_000_000_000u128)
+    } else {
+        None
+    };
     let submitter = Arc::new(
         Submitter::new(
             cfg.base_rpc_http.parse()?,
@@ -113,6 +137,7 @@ async fn main() -> Result<()> {
             cfg.flashblocks_endpoint.as_ref().map(|u| u.parse()).transpose()?,
             cfg.max_gas_cost()?,
             cfg.dry_run,
+            priority_fee,
         )
         .await?,
     );
@@ -126,6 +151,11 @@ async fn main() -> Result<()> {
     let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel::<LiquidationJob>();
     {
         let submitter_t = submitter.clone();
+        // Untuk fallback OEV->Classic: swap/ambang di-rebuild penuh sesuai
+        // mode Classic (hanya membalik mode meninggalkan amountIn split OEV
+        // sebesar ~30% profit, padahal Classic men-redeem seluruh sitaan —
+        // lihat rebuild_classic_job).
+        let strategy_fb = strategy.clone();
         let classic_fallback = cfg.classic_fallback;
         let submitter_concurrency = cfg.submitter_concurrency.max(1);
         tokio::spawn(async move {
@@ -135,15 +165,36 @@ async fn main() -> Result<()> {
             .for_each_concurrent(submitter_concurrency, move |job| {
                 let s = submitter_t.clone();
                 let cfb = classic_fallback;
+                let sf = strategy_fb.clone();
                 async move {
-                    if let Err(e) = s.simulate_and_send(job.clone()).await {
-                        warn!(?e, "kirim jalur A gagal");
-                        if cfb {
-                            let mut jb = job;
-                            jb.mode = Mode::Classic;
-                            if let Err(e2) = s.simulate_and_send(jb).await {
-                                warn!(?e2, "kirim jalur B gagal");
+                    let mode_before = job.mode;
+                    let outcome = match s.simulate_and_send(job.clone()).await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            warn!(?e, "kirim jalur A gagal");
+                            // transport error — bukan revert; fallback tetap dicoba
+                            // bila jalur yang gagal adalah OEV.
+                            crate::submitter::SendOutcome::Reverted
+                        }
+                    };
+                    if cfb
+                        && matches!(mode_before, Mode::Oev)
+                        && outcome == crate::submitter::SendOutcome::Reverted
+                    {
+                        // Rebuild SWAP+ambang untuk Classic: amountIn/expectedOut
+                        // OEV (repay + 30% profit) tidak boleh dipakai untuk
+                        // Classic yang men-redeem seluruh sitaan. lock pendek —
+                        // rebuild hanya memori markets/cfg yang di-clone.
+                        let strategy_guard = sf.lock().await;
+                        match strategy_guard.rebuild_classic_job(&job) {
+                            Ok(jb) => {
+                                drop(strategy_guard);
+                                match s.simulate_and_send(jb).await {
+                                    Ok(_) => {}
+                                    Err(e2) => warn!(?e2, "kirim jalur B gagal"),
+                                }
                             }
+                            Err(e) => warn!(?e, "rebuild job Classic gagal — fallback di-skip"),
                         }
                     }
                 }
@@ -197,8 +248,8 @@ async fn main() -> Result<()> {
             }
 
             // Perbarui posisi semua akun dari event di blok ini + deteksi trigger
-            // OEV (UpdatedPrices), dalam SATU kueri HyperSync. Nilai kembalian
-            // `true` berarti ada trigger OEV pada blok ini.
+            // OEV (PriceUpdatedEarlyAndLiquidated), dalam SATU kueri HyperSync.
+            // Nilai kembalian `true` berarti ada trigger OEV pada blok ini.
             let oev_trigger = match indexer.watch_block(number, number, &oev_wrappers).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -295,15 +346,33 @@ async fn build_market_map<P: Provider>(
     for m in &cfg.markets {
         let mtoken = Address::from_str(&m.mtoken)?;
         let underlying = Address::from_str(&m.underlying)?;
-        let cf = comptroller.markets(mtoken).call().await;
-        let collateral_factor = cf.map(|r| r.collateralFactorMantissa).unwrap_or_default();
-        let price = oracle.getUnderlyingPrice(mtoken).call().await.unwrap_or_default();
-        let seize_share = IMToken::new(mtoken, provider)
+        // Baca param dari chain; kegagalan dicatat (bukan diganti 0 diam-diam)
+        // karena collateral_factor/price 0 membuat scan keliru liquidatable.
+        let collateral_factor = match comptroller.markets(mtoken).call().await {
+            Ok(r) => r.collateralFactorMantissa,
+            Err(e) => {
+                warn!(?e, symbol = m.symbol, "gagal baca markets() — collateralFactor jadi 0");
+                Default::default()
+            }
+        };
+        let price = match oracle.getUnderlyingPrice(mtoken).call().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(?e, symbol = m.symbol, "gagal baca getUnderlyingPrice — price jadi 0");
+                Default::default()
+            }
+        };
+        let seize_share = match IMToken::new(mtoken, provider)
             .protocolSeizeShareMantissa()
             .call()
             .await
-            .ok()
-            .unwrap_or_default();
+        {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(?e, symbol = m.symbol, "gagal baca protocolSeizeShareMantissa — 0");
+                Default::default()
+            }
+        };
         // Fee liquidator OEV dari wrapper yang terdaftar di oracle (bila ada).
         // Config liquidator_fee_bps hanya dipakai sebagai fallback.
         let oev_fee_bps = match oracle.getFeed(m.symbol.clone()).call().await {
@@ -365,9 +434,9 @@ async fn refresh_prices<P: Provider + Clone>(
     Ok(())
 }
 
-/// Jalankan scan + submit karena trigger UpdatedPrices — terpisah dari task
-/// set reguler blok agar scan trigger tidak harus menunggu iterasi blok baru.
-/// Hasil disalurkan ke worker submitter via channel (bukan loop blok).
+/// Jalankan scan + submit karena trigger OEV — terpisah dari task set reguler
+/// blok agar scan trigger tidak harus menunggu iterasi blok baru. Hasil
+/// disalurkan ke worker submitter via channel (bukan loop blok).
 async fn spawn_scan<P: Provider + Clone + Send + Sync + 'static>(
     strategy: Arc<Mutex<Strategy<P>>>,
     provider: P,

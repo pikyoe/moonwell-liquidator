@@ -3,7 +3,7 @@ base_rpc_ws   = "wss://YOUR_RPC_WS"
 
 # Envio HyperSync — satu-satunya sumber event log bot.
 # RPC free-tier (Alchemy/QuickNode/Chainstack/Dwellir) memblokir `eth_getLogs`
-# sehingga pembacaan event Borrow/Mint/Repay/Transfer/UpdatedPrices TIDAK bisa
+# sehingga pembacaan event Borrow/Mint/Repay/Transfer/Liquidate TIDAK bisa
 # lewat RPC biasa. HyperSync adalah query layer yang menuai log tanpa
 # menggunakan eth_getLogs. eth_call dan health-check TETAP memakai base_rpc_http.
 # Daftar endpoint: https://docs.envio.dev/docs/hypersync/overview
@@ -11,6 +11,11 @@ hypersync_url   = "https://base.hypersync.xyz"
 # API token dari dashboard Envio (opsional untuk endpoint publik; wajib untuk
 # kuota lebih besar/private). Dapat juga diisi via env ENVIO_API_TOKEN.
 hypersync_token = ""
+# Whitelist alamat ChainlinkOEVWrapper untuk trigger scan OEV. Bot memantau
+# event `PriceUpdatedEarlyAndLiquidated` (bukan UpdatedPrices — itu tidak
+# dipancarkan). Bila kosong, trigger OEV nonaktif (scan tetap jalan per blok).
+# Wrapper WETH Base: 0x57DA741aD933869cC9EBfb9668288053A0738f3c
+# oev_wrappers = ["0x57DA741aD933869cC9EBfb9668288053A0738f3c"]
 # opsional: endpoint Flashblocks Base MAINNET (bukan sepolia) untuk preconf 200ms.
 # Semua public endpoint Base sudah Flashblocks-enabled (docs.base.org); contoh:
 #   https://mainnet.flashblocks.base.org
@@ -25,13 +30,16 @@ max_position_usd = 25000
 # minimum profit dalam wei TOKEN HASIL AKHIR (loan token bila swap aktif,
 # kolateral bila tidak). Fallback bila simbol tidak ada di map di bawah.
 # PERINGATAN: "0" berarti bot mengirim likuidasi berprofit nol — isi nilai
-# masuk akal, idealnya via [min_profit_per_symbol].
+# masuk akal, idealnya via [min_profit_per_symbol] di bawah.
 min_profit_wei = "0"
 
 # batas biaya gas per transaksi dalam wei ETH (default 0.0005 ETH).
 # Tx dengan estimasi gas cost di atas ini di-skip — melindungi dari
 # min_profit salah konfigurasi atau gas spike.
 max_gas_cost_wei = "500000000000000"
+# Priority fee (tip) dalam GWEI agar tx bersaing di mempool Base. 0 = pakai
+# rekomendasi node. Set mis. 0.2 (0.2 gwei) untuk likuidasi yang lebih agresif.
+priority_fee_gwei = 0
 # Override per simbol — penting karena desimal beda (WETH 18, USDC 6, cbBTC 8).
 # [min_profit_per_symbol]
 # WETH = "1000000000000000"   # 0.001 ETH

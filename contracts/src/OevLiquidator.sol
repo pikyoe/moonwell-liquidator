@@ -88,6 +88,19 @@ contract OevLiquidator {
     /// mencuri reserve via swapTarget/swapData arbitrer.
     bytes32 public expectedCallHash;
 
+    /// Reentrancy guard sederhana (tanpa dependensi OpenZeppelin).
+    /// Melindungi onMorphoFlashLoan dari reentrancy melalui swapToken /
+    /// redemption / redeem yang memanggil balik kontrak ini sebelum flashloan
+    /// selesai. Hanya satu callback aktif yang boleh masuk.
+    uint256 private _callbackDepth;
+
+    modifier nonReentrant() {
+        require(_callbackDepth == 0, "reentrancy");
+        _callbackDepth = 1;
+        _;
+        _callbackDepth = 0;
+    }
+
     error NotProfitable(uint256 profit, uint256 minProfit);
 
     /// Dipancarkan setelah tiap likuidasi sukses — untuk monitoring & akuntansi
@@ -139,7 +152,7 @@ contract OevLiquidator {
         );
     }
 
-    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external nonReentrant {
         require(msg.sender == address(morpho), "bad caller");
         LiquidationJob memory job = abi.decode(data, (LiquidationJob));
 
@@ -199,7 +212,39 @@ contract OevLiquidator {
         IERC20 collateralUnderlying = IERC20(job.mTokenCollateral.underlying());
         IOracle oracle = IOracle(comptroller.oracle());
         address wrapper = oracle.getFeed(IERC20Symbol(address(collateralUnderlying)).symbol());
-        require(wrapper != address(0), "no wrapper");
+
+        // Penyaring murah: wrapper yang sah harus punya kode DAN selector
+        // updatePriceEarlyAndLiquidate (0x16bb3b3a) di dispatcher — selalu di
+        // 256 byte pertama runtime code (terverifikasi on-chain: offset 54 utk
+        // wrapper WETH Base). Feed non-OEV (aggregator Chainlink wstETH/rETH/
+        // weETH, panjang 9.5 KB) tak punya selector ini. Panggilan berikutnya
+        // tetap gerbang final: wrapper yang meloloskan diri akan revert dengan
+        // pesan jelas dari memanggil fungsi yang tidak ada.
+        require(
+            wrapper != address(0) && wrapper.code.length > 0,
+            "no wrapper"
+        );
+        bool hasFn = false;
+        assembly {
+            // Periksa hanya 256 byte pertama runtime code (daerah dispatcher).
+            // Dispatcher menyimpan selector untuk tiap fungsi sebagai
+            // PUSH4 pada aliran byte dengan offset sembarang (4-byte aligned,
+            // BUKAN 32-byte aligned — wrapper produksi WETH punya selector di
+            // offset 54). Loop per-byte di bawah menangkap posisi mana pun.
+            //
+            // Salin dengan buffer kelipatan 32 (288 B): extcodecopy di luar
+            // panjang kode zero-fill, sehingga mload terakhir (offset 256..287)
+            // selalu berada di dalam buffer yang sah dan bernilai 0.
+            let ptr := mload(0x40)
+            extcodecopy(wrapper, ptr, 0, 288)
+            for { let i := 0 } lt(i, 256) { i := add(i, 1) } {
+                if eq(and(shr(224, mload(add(ptr, i))), 0xFFFFFFFF), 0x16bb3b3a) {
+                    hasFn := 1
+                    break
+                }
+            }
+        }
+        require(hasFn, "wrapper bukan OEV");
 
         job.loanToken.forceApprove(wrapper, job.repayAmount);
         IOevWrapper(wrapper).updatePriceEarlyAndLiquidate(

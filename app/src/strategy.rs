@@ -211,9 +211,25 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             return Ok(None);
         };
 
+        // Pilih moda eksekusi berdasarkan ketersediaan wrapper OEV pada market
+        // KOLATERAL. Feed yang bukan ChainlinkOEVWrapper (wstETH/rETH/weETH)
+        // TIDAK punya updatePriceEarlyAndLiquidate — eksekusi OEV pasti revert,
+        // jadi untuk market itu langsung pakai Classic (tanpa menunggu fallback
+        // dari submitter yang menambah satu round-trip sim).
+        let mode = if coll_info.oev_fee_bps.is_some() {
+            Mode::Oev
+        } else {
+            debug!(
+                ?mcoll,
+                coll_symbol = %coll_info.symbol,
+                "kolateral tanpa wrapper OEV — gunakan jalur Classic"
+            );
+            Mode::Classic
+        };
+
         // Bangun parameter swap (kalau diaktifkan dan asetnya beda).
         let (swap_target, swap_data, min_loan_out) =
-            self.build_swap(snap, &loan_info, &coll_info, repay)?;
+            self.build_swap(snap, &loan_info, &coll_info, repay, mode)?;
 
         // Kontrak mengukur profit di token hasil akhir: loan token bila swap
         // aktif, kolateral bila tidak. Ambil ambang per simbol agar desimal
@@ -225,7 +241,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         };
 
         let job = LiquidationJob {
-            mode: Mode::Oev,
+            mode,
             loanToken: loan_info.underlying,
             swapTarget: swap_target,
             swapData: swap_data,
@@ -249,8 +265,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         Ok(Some(job))
     }
 
-    /// Hitung estimasi sitaan liquidator (OEV split) lalu bangun calldata swap
-    /// kolateral -> loanToken. Mengembalikan (target, calldata, minLoanOut).
+    /// Hitung estimasi sitaan liquidator (split sesuai mode) lalu bangun calldata
+    /// swap kolateral -> loanToken. Mengembalikan (target, calldata, minLoanOut).
     /// Jika swap nonaktif atau aset sama: (ZERO, kosong, 0).
     fn build_swap(
         &self,
@@ -258,7 +274,22 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         loan: &MarketInfo,
         coll: &MarketInfo,
         repay: U256,
+        mode: Mode,
     ) -> Result<(Address, alloy::primitives::Bytes, U256)> {
+        build_swap_parts(snap, loan, coll, repay, mode)
+    }
+}
+
+/// Versi bebas (tanpa &self) dari logika swap — dipakai oleh evaluator
+/// (`ScanJob::build_swap`) dan oleh `Strategy::rebuild_classic_job` untuk
+/// fallback OEV->Classic yang menghitung ulang calldata sesuai mode.
+fn build_swap_parts(
+    snap: &ScanSnapshot,
+    loan: &MarketInfo,
+    coll: &MarketInfo,
+    repay: U256,
+    mode: Mode,
+) -> Result<(Address, alloy::primitives::Bytes, U256)> {
         let zero: alloy::primitives::Bytes = Default::default();
         if !snap.cfg.swap.enabled || loan.underlying == coll.underlying {
             return Ok((Address::ZERO, zero, U256::ZERO));
@@ -280,11 +311,20 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         let seized_usd = repay_usd * snap.liquidation_incentive / one
             * (one - coll.protocol_seize_share) / one;
         let gross_profit_usd = seized_usd.saturating_sub(repay_usd);
-        // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000.
-        // Fee dibaca on-chain per market bila tersedia; config hanya fallback.
-        let fee_bps = coll.oev_fee_bps.unwrap_or(snap.cfg.swap.liquidator_fee_bps);
-        let liquidator_usd = repay_usd
-            + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64);
+
+        // Beda moda:
+        //  - OEV:     liquidator dapat repay + profit * liquidatorFeeBps/10000
+        //            (wrapper membagi sisa dengan feeRecipient protokol).
+        //  - Classic: liquidator menerima SEMUA profit (tidak ada split).
+        let liquidator_usd = match mode {
+            Mode::Oev => {
+                let fee_bps = coll.oev_fee_bps.unwrap_or(snap.cfg.swap.liquidator_fee_bps);
+                repay_usd
+                    + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64)
+            }
+            // Classic maupun variant tak dikenal dianggap penuh (tanpa split).
+            _ => repay_usd + gross_profit_usd,
+        };
 
         // konversi ke unit underlying kolateral & estimasi hasil dalam loanToken
         let amount_in = liquidator_usd * one / coll.price;
@@ -327,6 +367,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         Ok((target, data, min_loan_out))
     }
 
+impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
     async fn cap_by_max_position(
         &self,
         snap: &ScanSnapshot,
@@ -393,9 +434,161 @@ impl<P> Strategy<P> {
         })
     }
 
+    /// Rebuild field swap/profit sebuah job untuk mode lain (Classic) dari data
+    /// pasar yang sama. Dipakai submitter saat fallback OEV->Classic: hanya
+    /// membalik `job.mode` membuat amountIn/expectedOut selisih split OEV
+    /// (repay + 30% profit) padahal kontrak redeem SELURUH sitaan pada jalur
+    /// Classic (repay + 100% profit) — calldata swap kekurangan aset dan
+    /// profit terukur jatuh di bawah minProfit. Di sini swapData/minLoanOut/
+    /// minProfit dihitung ulang sesuai mode tanpa scan/RPC.
+    ///
+    /// Err bila data pasar untuk token loan/kolateral tidak dimuat — pemanggil
+    /// TIDAK boleh mengirim dengan field swap yang basi.
+    pub fn rebuild_classic_job(&self, job: &LiquidationJob) -> Result<LiquidationJob> {
+        let loan_addr = job.mTokenLoan;
+        let coll_addr = job.mTokenCollateral;
+        let (Some(loan), Some(coll)) =
+            (self.markets.get(&loan_addr), self.markets.get(&coll_addr))
+        else {
+            return Err(anyhow::anyhow!(
+                "market {loan_addr:?}/{coll_addr:?} tak dimuat — tak bisa rebuild swap Classic"
+            ));
+        };
+
+        let mut new_job = job.clone();
+        new_job.mode = Mode::Classic;
+        new_job.minLoanOut = U256::ZERO;
+        new_job.swapTarget = Address::ZERO;
+        new_job.swapData = alloy::primitives::Bytes::new();
+
+        if self.cfg.swap.enabled && loan.underlying != coll.underlying {
+            let (swap_target, swap_data, min_loan_out) =
+                build_swap_parts(&self.snapshot_local(), loan, coll, job.repayAmount, Mode::Classic)?;
+            new_job.swapTarget = swap_target;
+            new_job.swapData = swap_data;
+            new_job.minLoanOut = min_loan_out;
+            // Dengan swap, profit diukur di loan token.
+            new_job.minProfit = self.cfg.min_profit_for_symbol(&loan.symbol)?;
+        } else {
+            // Tanpa swap profit diukur di kolateral; ambang untuk simbol kolateral.
+            new_job.minProfit = self.cfg.min_profit_for_symbol(&coll.symbol)?;
+        }
+        Ok(new_job)
+    }
+
+    // Snapshot field strategy sebagai ScanSnapshot sehingga build_swap_parts
+    // (yang menerima &ScanSnapshot) bisa dipakai dari rebuild_classic_job
+    // tanpa mengubah signature evaluasi. Clone memori murni, tanpa await.
+    fn snapshot_local(&self) -> ScanSnapshot {
+        ScanSnapshot {
+            state: self.state.clone(),
+            cfg: self.cfg.clone(),
+            markets: self.markets.clone(),
+            executor: self.executor,
+            close_factor: self.close_factor,
+            liquidation_incentive: self.liquidation_incentive,
+        }
+    }
+
     pub fn update_price(&mut self, mtoken: Address, price: U256) {
         if let Some(info) = self.markets.get_mut(&mtoken) {
             info.price = price;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AccountState;
+
+    fn addr(n: u8) -> Address {
+        Address::with_last_byte(n)
+    }
+
+    /// Snapshot dengan dua market: mUSDC (loan, harga 1 USD) & mWETH
+    /// (kolateral, harga 2000 USD), incentive 1.1e18, seize share 3%.
+    fn snapshot() -> ScanSnapshot {
+        let mut cfg: Config = toml::from_str(
+            r#"
+base_rpc_http = "https://x"
+base_rpc_ws = "wss://x"
+private_key = "0x"
+executor_address = "0x0000000000000000000000000000000000000001"
+min_profit_wei = "1000"
+"#,
+        )
+        .unwrap();
+        cfg.swap.enabled = true;
+        cfg.swap.slippage_bps = 200;
+
+        let mut markets = HashMap::new();
+        markets.insert(
+            addr(1),
+            MarketInfo {
+                underlying: addr(0x11),
+                symbol: "USDC".into(),
+                collateral_factor: U256::from(10u64.pow(18)),
+                price: U256::from(10u64.pow(18)).pow(U256::from(2)), // 1e36
+                protocol_seize_share: U256::from(3 * 10u64.pow(16)),
+                oev_fee_bps: Some(3000),
+            },
+        );
+        markets.insert(
+            addr(2),
+            MarketInfo {
+                underlying: addr(0x22),
+                symbol: "WETH".into(),
+                collateral_factor: U256::from(10u64.pow(18)),
+                price: U256::from(2000u64) * U256::from(10u64.pow(18)).pow(U256::from(2)), // 2000e36
+                protocol_seize_share: U256::from(3 * 10u64.pow(16)),
+                oev_fee_bps: Some(3000),
+            },
+        );
+
+        ScanSnapshot {
+            state: Arc::new(AccountState::new()),
+            cfg,
+            markets,
+            executor: addr(0x99),
+            close_factor: U256::from(5 * 10u64.pow(17)),
+            liquidation_incentive: U256::from(11 * 10u64.pow(17)),
+        }
+    }
+
+    /// Fallback OEV->Classic harus menaikkan amount_in karena Classic
+    /// men-redeem SELURUH sitaan (profit 100%) bukan split OEV 30%.
+    /// Kalau tidak, calldata swap menukar terlalu sedikit & profit < minProfit
+    /// sehingga fallback klasik selalu gagal. (Fix PR #14 comment #1.)
+    #[test]
+    fn rebuild_classic_amount_in_lebih_besar_dari_oev() {
+        let snap = snapshot();
+        // repay ~ $10.000 di mUSDC, collateral mWETH.
+        let repay = U256::from(10_000u64) * U256::from(10u64.pow(6)); // USDC 6 desimal
+
+        let oev = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Oev).unwrap();
+        let classic = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Classic).unwrap();
+
+        // amount_in dalam wei WETH (18 des). Classic > OEV karena split penuh.
+        assert!(
+            classic.0 != Address::ZERO && oev.0 != Address::ZERO,
+            "swap aktif untuk kedua mode"
+        );
+        // dekode amountIn dari calldata swap terlebih dahulu — lebih sederhana:
+        // bandingkan `expected_loan_out` via minLoanOut (lebih besar utk Classic).
+        assert!(classic.2 > oev.2, "Classic harus menjanjikan lebih banyak loan out");
+    }
+
+    /// Bila swap nonaktif, rebuild menonaktifkan swapTarget dan memakai ambang
+    /// minProfit kolateral — job Classic tetap valid.
+    #[test]
+    fn rebuild_dengan_swap_nonaktif_tidak_pakai_swap() {
+        let mut snap = snapshot();
+        snap.cfg.swap.enabled = false;
+        let repay = U256::from(10_000u64) * U256::from(10u64.pow(6));
+        let out = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Classic).unwrap();
+        assert_eq!(out.0, Address::ZERO);
+        assert_eq!(out.1.len(), 0);
+        assert_eq!(out.2, U256::ZERO);
     }
 }

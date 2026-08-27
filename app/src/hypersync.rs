@@ -2,7 +2,7 @@
 //!
 //! RPC free-tier umumnya memblokir `eth_getLogs`. HyperSync adalah query layer
 //! yang menuai event log tanpa JSON-RPC, sehingga bot tetap bisa memantau event
-//! Borrow/Mint/Repay/Transfer/Liquidate/UpdatedPrices yang dibutuhkan indexer.
+//! Borrow/Mint/Repay/Transfer/Liquidate dan trigger OEV yang dibutuhkan indexer.
 //!
 //! Module ini hanya menghasilkan data log mentah; decoding event tetap memakai
 //! `alloy::sol!` yang sudah ada (lihat `indexer.rs`).
@@ -137,12 +137,12 @@ impl HyperSync {
     }
 
     /// Satu kueri untuk seluruh blok: (1) log semua market untuk refresh posisi
-    /// DAN (2) log `UpdatedPrices` dari wrapper OEV untuk trigger scan.
-    /// Menghemat menjadi SATU request per blok (bukan 2) — penting agar berada
-    /// di bawah batas RPM plan.
+    /// DAN (2) log `PriceUpdatedEarlyAndLiquidated` dari wrapper OEV untuk
+    /// trigger scan. Menghemat menjadi SATU request per blok (bukan 2) —
+    /// penting agar berada di bawah batas RPM plan.
     ///
     /// Mengembalikan `(market_logs, oev_trigger)` — `oev_trigger` `true` bila
-    /// ada event UpdatedPrices pada blok tsb dari salah satu `oev_addresses`.
+    /// ada event trigger OEV pada blok tsb dari salah satu `oev_addresses`.
     pub async fn market_and_trigger(
         &self,
         market_addrs: &[alloy::primitives::Address],
@@ -154,7 +154,7 @@ impl HyperSync {
         let market_matcher = address_matcher(market_addrs)?;
         let matcher = if !oev_addrs.is_empty() {
             let oev = address_matcher(oev_addrs)?.and_topic0([topic0_arr(oev_topic0)])?;
-            // OR: log semua event market ATAU event UpdatedPrices dari wrapper OEV.
+            // OR: log semua event market ATAU event OEV dari wrapper.
             market_matcher.or(oev)
         } else {
             market_matcher.into()
@@ -182,7 +182,7 @@ impl HyperSync {
                 for log in batch {
                     if let Some(rpc_log) = convert(log) {
                         // Log dari alamat market → refresh posisi. Log lain yang
-                        // cocok (alamat wrapper OEV) → sinyal UpdatedPrices.
+                        // cocok (alamat wrapper OEV) → sinyal trigger OEV.
                         if market_addrs.contains(&rpc_log.address()) {
                             market_logs.push(rpc_log);
                         } else {
