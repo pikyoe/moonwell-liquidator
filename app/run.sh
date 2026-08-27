@@ -76,7 +76,7 @@ start() {
 
   # Ambil flock atomik dulu: dua `./run.sh start` bersamaan tidak boleh dua-duanya
   # lolos (TOCTOU). Buka fd 9 dan kunci; lock hanya menjaga window launch —
-  # fd 9 ditutup sebelum meluncurkan child agar tidak bocor ke proses bot.
+  # dilepas (exec 9>&-) segera setelah bot ter-launch, sebelum menampilkan log.
   exec 9>"$LOCKFILE"
   if ! flock -n 9; then
     echo "Lockfile '$LOCKFILE' terkunci — start lain sedang berjalan."
@@ -96,9 +96,20 @@ start() {
   trap 'rm -f "$PIDFILE"' EXIT
 
   rotate_logs
-  nohup "$BIN" >>"$LOG" 2>&1 9<&- &
+
+  # Luncurkan bot di SESSION tersendiri (setsid): tanpa job control di shell
+  # skrip, bot berbagi process group dengan skrip, jadi Ctrl+C pada `tail -f`
+  # (SIGINT ke foreground process group) akan ikut membunuh bot. setsid
+  # memisahkan session sehingga sinyal terminal tidak menjangkau bot.
+  # Fallback ke nohup bila setsid tidak tersedia.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$BIN" >>"$LOG" 2>&1 9<&- &
+  else
+    nohup "$BIN" >>"$LOG" 2>&1 9<&- &
+  fi
   echo $! >"$PIDFILE"
   trap - EXIT                   # sukses — lepas trap bersih-bersih
+  exec 9>&-                     # lepas flock — lock hanya menjaga window launch
 
   echo "Bot dimulai. PID=$(cat "$PIDFILE")"
   if [ "$detach" -eq 1 ]; then
