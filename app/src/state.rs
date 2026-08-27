@@ -46,19 +46,19 @@ impl AccountState {
     /// sumber kebenaran: nilai 0 = posisi benar-benar sudah tidak ada.
     pub fn upsert_or_remove(&self, account: Address, market: Address, pos: Position) {
         if pos.borrow_balance == U256::ZERO && pos.mtoken_balance == U256::ZERO {
-            // Tidak ada posisi tersisa — hapus dari map posisi. Guard hashed
-            // di-drop pada akhir scope (sebelum pembacaan `still_borrows`)
-            // untuk menghindari double-borrow pada DashMap.
-            let remove_account = {
-                let mut remove_account = false;
+            // Tidak ada posisi tersisa — hapus market dari inner map.
+            let account_empty = {
                 if let Some(inner) = self.positions.get_mut(&account) {
                     inner.remove(&market);
-                    remove_account = inner.is_empty();
                 }
-                remove_account
+                self.positions.get(&account).map(|i| i.is_empty()).unwrap_or(true)
             };
-            if remove_account {
-                self.positions.remove(&account);
+            if account_empty {
+                // Hapus entri akun secara ATOMIK hanya bila inner masih kosong.
+                // `remove_if` mengambil lock sendiri dan mengecek predikat di
+                // bawah lock, menutup window TOCTOU: upsert paralel yang menambah
+                // market baru di sela-sela guard tidak akan ikut terhapus.
+                self.positions.remove_if(&account, |_, inner| inner.is_empty());
             }
             // Hapus dari daftar borrower bila tidak ada posisi pinjam tersisa
             // di market mana pun (bisa saja masih pinjam di market lain).
