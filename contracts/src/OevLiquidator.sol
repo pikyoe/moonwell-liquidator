@@ -226,29 +226,23 @@ contract OevLiquidator {
         );
         bool hasFn = false;
         assembly {
-            // 256 byte pertama runtime code; extcodecopy di luar batas zero-fill.
+            // Periksa hanya 256 byte pertama runtime code (daerah dispatcher).
+            // Dispatcher menyimpan selector untuk tiap fungsi sebagai
+            // PUSH4 pada aliran byte dengan offset sembarang (4-byte aligned,
+            // BUKAN 32-byte aligned — wrapper produksi WETH punya selector di
+            // offset 54). Loop per-byte di bawah menangkap posisi mana pun.
+            //
+            // Salin dengan buffer kelipatan 32 (288 B): extcodecopy di luar
+            // panjang kode zero-fill, sehingga mload terakhir (offset 256..287)
+            // selalu berada di dalam buffer yang sah dan bernilai 0.
             let ptr := mload(0x40)
-            extcodecopy(wrapper, ptr, 0, 256)
-            // 8 kemungkinan posisi selector beroffset 4-byte (dispatcher
-            // menyimpannya selebar 32 byte). Cukup 8 slot untuk 256 byte.
-            let s0 := shr(224, mload(ptr))
-            let s1 := shr(224, mload(add(ptr, 32)))
-            let s2 := shr(224, mload(add(ptr, 64)))
-            let s3 := shr(224, mload(add(ptr, 96)))
-            let s4 := shr(224, mload(add(ptr, 128)))
-            let s5 := shr(224, mload(add(ptr, 160)))
-            let s6 := shr(224, mload(add(ptr, 192)))
-            let s7 := shr(224, mload(add(ptr, 224)))
-            hasFn := or(
-                or(
-                    or(eq(s0, 0x16bb3b3a), eq(s1, 0x16bb3b3a)),
-                    or(eq(s2, 0x16bb3b3a), eq(s3, 0x16bb3b3a))
-                ),
-                or(
-                    or(eq(s4, 0x16bb3b3a), eq(s5, 0x16bb3b3a)),
-                    or(eq(s6, 0x16bb3b3a), eq(s7, 0x16bb3b3a))
-                )
-            )
+            extcodecopy(wrapper, ptr, 0, 288)
+            for { let i := 0 } lt(i, 256) { i := add(i, 1) } {
+                if eq(and(shr(224, mload(add(ptr, i))), 0xFFFFFFFF), 0x16bb3b3a) {
+                    hasFn := 1
+                    break
+                }
+            }
         }
         require(hasFn, "wrapper bukan OEV");
 

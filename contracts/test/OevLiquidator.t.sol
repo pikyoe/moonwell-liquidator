@@ -261,6 +261,42 @@ contract OevLiquidatorTest is Test {
         executor.execute(job);
     }
 
+    /// Posisi selector BUKAN kelipatan 32 harus tetap terdeteksi. Dispatcher
+    /// Solidity menyimpan selector sebagai PUSH4 (0x63 + 4 byte) pada aliran
+    /// byte dengan offset 4-byte aligned — wrapper WETH produksi memilikinya
+    /// di offset 54. Bytecode dummy di bawah menaruh `6316bb3b3a` (PUSH4 +
+    /// selector) di offset 54, didahului STOP (00) agar tidak dieksekusi.
+    /// Karena filter lolos, eksekusi berlanjut ke call wrapper yang "berhasil"
+    /// (STOP) tapi tanpa sitaan -> revert "zero seized". Bila scan hanya
+    /// melihat offset kelipatan 32, test ini revert "wrapper bukan OEV" dan
+    /// gagal.
+    function testOevDetectsNonAlignedSelector() public {
+        address borrower = _createUnderwaterBorrower();
+        address dummy = makeAddr("dummy-wrapper");
+
+        bytes memory code = new bytes(288);
+        // offset 0..53: STOP (tidak dieksekusi lebih jauh)
+        for (uint256 i = 0; i < 54; i++) code[i] = 0x00;
+        // offset 54..58: PUSH4 0x16bb3b3a (byte selector tepat di offset 55)
+        code[54] = 0x63;
+        code[55] = 0x16;
+        code[56] = 0xbb;
+        code[57] = 0x3b;
+        code[58] = 0x3a;
+
+        vm.etch(dummy, code);
+        vm.mockCall(
+            ORACLE,
+            abi.encodeWithSelector(IOracle.getFeed.selector, "WETH"),
+            abi.encode(dummy)
+        );
+        LiquidationJob memory job = _buildJob(Mode.Oev, borrower);
+        // Filter menemukan selector di offset 55 (non-32); call ke wrapper
+        // "sukses" (STOP), sitaan 0 -> revert di tahap redeem.
+        vm.expectRevert("zero seized");
+        executor.execute(job);
+    }
+
     /// Simulasi jalur OEV penuh memerlukan borrower underwater pada state fork.
     /// Tanpa data historis, kita pastikan eth_call revert terkontrol.
     /// Wrapper mungkin revert duluan karena flashloan tidak bisa dikembalikan
