@@ -101,6 +101,11 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
                 Err(e) => {
                     warn!(?e, start, end, "get_logs gagal — rentang dilewati");
                     start = end + 1;
+                    // Awali range baru dengan anggaran retry & backoff segar —
+                    // jangan biarkan cap 429 dari range sebelumnya "menempel"
+                    // sehingga range baru langsung fell-through ke skip.
+                    rate_limit_retries = 0;
+                    backoff = Duration::from_millis(1500);
                 }
             }
         }
