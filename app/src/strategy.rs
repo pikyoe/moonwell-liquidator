@@ -55,7 +55,10 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
     /// Evaluasi semua borrower secara paralel (konkurensi terbatas lewat
     /// semaphore) dan kembalikan daftar job likuidasi yang lolos simulasinya.
     pub async fn run(self: &Arc<Self>) -> Vec<LiquidationJob> {
-        let sem = Arc::new(Semaphore::new(self.snapshot.cfg.eval_concurrency));
+        // Konkurensi minimal 1 — bila config set eval_concurrency=0 semaphore
+        // jadi 0 permit dan semua task block selamanya. Konsisten dengan
+        // indexer (.max(1)) dan submitter (.max(1)).
+        let sem = Arc::new(Semaphore::new(self.snapshot.cfg.eval_concurrency.max(1)));
         let mut set = tokio::task::JoinSet::new();
         for borrower in &self.borrowers {
             let borrower = *borrower;
