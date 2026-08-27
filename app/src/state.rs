@@ -60,16 +60,19 @@ impl AccountState {
                 // market baru di sela-sela guard tidak akan ikut terhapus.
                 self.positions.remove_if(&account, |_, inner| inner.is_empty());
             }
-            // Hapus dari daftar borrower bila tidak ada posisi pinjam tersisa
-            // di market mana pun (bisa saja masih pinjam di market lain).
-            let still_borrows = self
-                .positions
-                .get(&account)
-                .map(|inner| inner.iter().any(|p| p.borrow_balance > U256::ZERO))
-                .unwrap_or(false);
-            if !still_borrows {
-                self.borrowers.remove(&account);
-            }
+            // Hapus dari daftar borrower hanya bila tidak ada posisi pinjam
+            // tersisa di market mana pun (bisa saja masih pinjam di market
+            // lain). Diputuskan via `borrowers.remove_if` agar evaluasi &
+            // penghapusan terjadi dalam satu operasi atomik pada shard
+            // borrower: refresh paralel untuk akun sama yang menulis posisi
+            // pinjam di sela-sela tidak akan membuat kita menghapus akun yang
+            // sebenarnya masih punya pinjaman aktif.
+            self.borrowers.remove_if(&account, |_, _| {
+                self.positions
+                    .get(&account)
+                    .map(|inner| inner.iter().all(|p| p.borrow_balance == U256::ZERO))
+                    .unwrap_or(true)
+            });
         } else {
             self.upsert(account, market, pos);
         }
