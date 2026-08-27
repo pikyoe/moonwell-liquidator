@@ -38,6 +38,43 @@ impl AccountState {
         }
     }
 
+    /// Tulis posisi hasil snapshot SEGAR. Jika snapshot menunjukkan tak ada
+    /// saldo pinjam maupun supply (borrow==0 && mtoken==0), posisi HISTORIS
+    /// yang basi dihapus — borrower yang sudah lunas/bersih tidak lagi
+    /// ditelusuri (sebelumnya tersisa abadi di state, memicu job likuidasi
+    /// palsu yang revert setiap blok). Memanfaatkan fakta snapshot adalah
+    /// sumber kebenaran: nilai 0 = posisi benar-benar sudah tidak ada.
+    pub fn upsert_or_remove(&self, account: Address, market: Address, pos: Position) {
+        if pos.borrow_balance == U256::ZERO && pos.mtoken_balance == U256::ZERO {
+            // Tidak ada posisi tersisa — hapus market dari inner map.
+            let account_empty = {
+                if let Some(inner) = self.positions.get_mut(&account) {
+                    inner.remove(&market);
+                }
+                self.positions.get(&account).map(|i| i.is_empty()).unwrap_or(true)
+            };
+            if account_empty {
+                // Hapus entri akun secara ATOMIK hanya bila inner masih kosong.
+                // `remove_if` mengambil lock sendiri dan mengecek predikat di
+                // bawah lock, menutup window TOCTOU: upsert paralel yang menambah
+                // market baru di sela-sela guard tidak akan ikut terhapus.
+                self.positions.remove_if(&account, |_, inner| inner.is_empty());
+            }
+            // Hapus dari daftar borrower bila tidak ada posisi pinjam tersisa
+            // di market mana pun (bisa saja masih pinjam di market lain).
+            let still_borrows = self
+                .positions
+                .get(&account)
+                .map(|inner| inner.iter().any(|p| p.borrow_balance > U256::ZERO))
+                .unwrap_or(false);
+            if !still_borrows {
+                self.borrowers.remove(&account);
+            }
+        } else {
+            self.upsert(account, market, pos);
+        }
+    }
+
     pub fn borrowers(&self) -> Vec<Address> {
         self.borrowers.iter().map(|e| *e.key()).collect()
     }

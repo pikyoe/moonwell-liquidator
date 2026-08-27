@@ -162,7 +162,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         for market in [mloan, mcoll] {
             let mtoken = IMToken::new(market, &self.provider);
             match mtoken.getAccountSnapshot(borrower).call().await {
-                Ok(s) => snap.state.upsert(
+                Ok(s) => snap.state.upsert_or_remove(
                     borrower,
                     market,
                     Position {
