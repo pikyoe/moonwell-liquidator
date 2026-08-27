@@ -19,10 +19,22 @@ alloy::sol! {
     event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
-    /// Moonwell OEV wrapper — dipancarkan ketika harga wrapper diperbaharui.
-    /// Saat ini berarti "harga on-chain baru ditukwal" dan liquidasi path ada.
-    /// Bot menghasilkan trigger lebih cepat daripada refresh harga 10-block.
-    event UpdatedPrices(uint256 roundId, int256 answer, bool isOEV);
+    /// Moonwell ChainlinkOEVWrapper — event yang BENAR-BENAR dipancarkan saat
+    /// `updatePriceEarlyAndLiquidate` dijalankan (diverifikasi di bytecode
+    /// seluruh wrapper Base & source resmi moonwell-contracts-v2).
+    /// Kehadirannya = harga kolateral wrapper baru di-unlock + likuidasi via
+    /// jalur OEV sedang/sudah terjadi → scan ulang langsung lebih akurat
+    /// daripada menunggu refresh harga 10-blok.
+    /// Catatan audit: kode lama memakai event fiktif `UpdatedPrices(uint256,
+    /// int256,bool)` yang tidak pernah dipancarkan wrapper — trigger OEV mati.
+    event PriceUpdatedEarlyAndLiquidated(
+        address indexed borrower,
+        uint256 repayAmount,
+        address indexed mTokenCollateral,
+        address indexed mTokenLoan,
+        uint256 protocolFee,
+        uint256 liquidatorFee
+    );
 }
 
 pub struct Indexer<P: Provider> {
@@ -138,16 +150,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
     /// Handler satu blok / rentang blok. Dipanggil per blok di main loop dan juga
     /// untuk mem-replay rentang yang terlewat saat reconnect WS.
     ///
-    /// SATU kueri HyperSync mencakup log market (untuk refresh posisi) DAN event
-    /// `UpdatedPrices` wrapper OEV (untuk trigger scan) — jadi hanya `1 request`
-    /// per blok, bukan 2, agar tetap di bawah batas RPM plan.
+    /// SATU kueri HyperSync mencakup log market (untuk refresh posisi) DAN
+    /// event `PriceUpdatedEarlyAndLiquidated` wrapper OEV (untuk trigger scan)
+    /// — jadi hanya `1 request` per blok, bukan 2, agar tetap di bawah batas
+    /// RPM plan.
     ///
     /// Semua refresh akun dijalankan PARALEL (konkurensi terbatas) agar satu
     /// blok ramai tidak menambahkan latensi RPC beruntun pada jalur kritis
     /// deteksi. Dedup per (market, akun) dilakukan sebelum refresh.
     ///
-    /// Kembali `true` bila ada event `UpdatedPrices` pada rentang tsb
-    /// (sinyal untuk scan jalur OEV).
+    /// Kembali `true` bila ada event `PriceUpdatedEarlyAndLiquidated` pada
+    /// rentang tsb (sinyal untuk scan jalur OEV).
     pub async fn watch_block(
         &self,
         from_block: u64,
@@ -159,7 +172,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
             .market_and_trigger(
                 &self.markets,
                 oev_wrappers,
-                &UpdatedPrices::SIGNATURE_HASH,
+                &PriceUpdatedEarlyAndLiquidated::SIGNATURE_HASH,
                 from_block,
                 to_block,
             )

@@ -211,9 +211,25 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             return Ok(None);
         };
 
+        // Pilih moda eksekusi berdasarkan ketersediaan wrapper OEV pada market
+        // KOLATERAL. Feed yang bukan ChainlinkOEVWrapper (wstETH/rETH/weETH)
+        // TIDAK punya updatePriceEarlyAndLiquidate — eksekusi OEV pasti revert,
+        // jadi untuk market itu langsung pakai Classic (tanpa menunggu fallback
+        // dari submitter yang menambah satu round-trip sim).
+        let mode = if coll_info.oev_fee_bps.is_some() {
+            Mode::Oev
+        } else {
+            debug!(
+                ?mcoll,
+                coll_symbol = %coll_info.symbol,
+                "kolateral tanpa wrapper OEV — gunakan jalur Classic"
+            );
+            Mode::Classic
+        };
+
         // Bangun parameter swap (kalau diaktifkan dan asetnya beda).
         let (swap_target, swap_data, min_loan_out) =
-            self.build_swap(snap, &loan_info, &coll_info, repay)?;
+            self.build_swap(snap, &loan_info, &coll_info, repay, mode)?;
 
         // Kontrak mengukur profit di token hasil akhir: loan token bila swap
         // aktif, kolateral bila tidak. Ambil ambang per simbol agar desimal
@@ -225,7 +241,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         };
 
         let job = LiquidationJob {
-            mode: Mode::Oev,
+            mode,
             loanToken: loan_info.underlying,
             swapTarget: swap_target,
             swapData: swap_data,
@@ -249,15 +265,16 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         Ok(Some(job))
     }
 
-    /// Hitung estimasi sitaan liquidator (OEV split) lalu bangun calldata swap
-    /// kolateral -> loanToken. Mengembalikan (target, calldata, minLoanOut).
-    /// Jika swap nonaktif atau aset sama: (ZERO, kosong, 0).
+    /// Hitung estimasi sitaan liquidator (split sesuai mode) lalu bangun calldata
+/// swap kolateral -> loanToken. Mengembalikan (target, calldata, minLoanOut).
+/// Jika swap nonaktif atau aset sama: (ZERO, kosong, 0).
     fn build_swap(
         &self,
         snap: &ScanSnapshot,
         loan: &MarketInfo,
         coll: &MarketInfo,
         repay: U256,
+        mode: Mode,
     ) -> Result<(Address, alloy::primitives::Bytes, U256)> {
         let zero: alloy::primitives::Bytes = Default::default();
         if !snap.cfg.swap.enabled || loan.underlying == coll.underlying {
@@ -280,11 +297,20 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         let seized_usd = repay_usd * snap.liquidation_incentive / one
             * (one - coll.protocol_seize_share) / one;
         let gross_profit_usd = seized_usd.saturating_sub(repay_usd);
-        // jalur OEV: liquidator dapat repay + profit * liquidatorFeeBps/10000.
-        // Fee dibaca on-chain per market bila tersedia; config hanya fallback.
-        let fee_bps = coll.oev_fee_bps.unwrap_or(snap.cfg.swap.liquidator_fee_bps);
-        let liquidator_usd = repay_usd
-            + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64);
+
+        // Beda moda:
+        //  - OEV:     liquidator dapat repay + profit * liquidatorFeeBps/10000
+        //            (wrapper membagi sisa dengan feeRecipient protokol).
+        //  - Classic: liquidator menerima SEMUA profit (tidak ada split).
+        let liquidator_usd = match mode {
+            Mode::Oev => {
+                let fee_bps = coll.oev_fee_bps.unwrap_or(snap.cfg.swap.liquidator_fee_bps);
+                repay_usd
+                    + gross_profit_usd * U256::from(fee_bps) / U256::from(10_000u64)
+            }
+            // Classic maupun variant tak dikenal dianggap penuh (tanpa split).
+            _ => repay_usd + gross_profit_usd,
+        };
 
         // konversi ke unit underlying kolateral & estimasi hasil dalam loanToken
         let amount_in = liquidator_usd * one / coll.price;

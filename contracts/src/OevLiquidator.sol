@@ -88,6 +88,19 @@ contract OevLiquidator {
     /// mencuri reserve via swapTarget/swapData arbitrer.
     bytes32 public expectedCallHash;
 
+    /// Reentrancy guard sederhana (tanpa dependensi OpenZeppelin).
+    /// Melindungi onMorphoFlashLoan dari reentrancy melalui swapToken /
+    /// redemption / redeem yang memanggil balik kontrak ini sebelum flashloan
+    /// selesai. Hanya satu callback aktif yang boleh masuk.
+    uint256 private _callbackDepth;
+
+    modifier nonReentrant() {
+        require(_callbackDepth == 0, "reentrancy");
+        _callbackDepth = 1;
+        _;
+        _callbackDepth = 0;
+    }
+
     error NotProfitable(uint256 profit, uint256 minProfit);
 
     /// Dipancarkan setelah tiap likuidasi sukses — untuk monitoring & akuntansi
@@ -139,7 +152,7 @@ contract OevLiquidator {
         );
     }
 
-    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external {
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external nonReentrant {
         require(msg.sender == address(morpho), "bad caller");
         LiquidationJob memory job = abi.decode(data, (LiquidationJob));
 
@@ -199,7 +212,36 @@ contract OevLiquidator {
         IERC20 collateralUnderlying = IERC20(job.mTokenCollateral.underlying());
         IOracle oracle = IOracle(comptroller.oracle());
         address wrapper = oracle.getFeed(IERC20Symbol(address(collateralUnderlying)).symbol());
-        require(wrapper != address(0), "no wrapper");
+
+        // Wrapper yang sah harus punya fungsi updatePriceEarlyAndLiquidate.
+        // Untuk feed yang bukan ChainlinkOEVWrapper (mis. aggregator Chainlink
+        // biasa seperti wstETH/rETH/weETH) panggilan berikut akan revert — bot
+        // off-chain sudah memilih Mode::Classic untuk kasus tersebut, tapi
+        // kontrak juga mem-forward-fault dengan pesan yang jelas.
+        require(
+            wrapper != address(0) && wrapper.code.length > 0,
+            "no wrapper"
+        );
+
+        bool hasFn = false;
+        assembly {
+            // Scan seluruh runtime code untuk 4-byte selector
+            // 0x16bb3b3a (updatePriceEarlyAndLiquidate) di offset mana pun —
+            // selector ikut termuat ke memori bersama bytecode.
+            let codeLen := extcodesize(wrapper)
+            let ptr := mload(0x40)
+            extcodecopy(wrapper, ptr, 0, codeLen)
+            for { let i := 0 } lt(i, codeLen) { i := add(i, 1) } {
+                // baca 4 byte pada offset i
+                let word := mload(add(ptr, i))
+                let sel := shr(224, word)
+                if eq(sel, 0x16bb3b3a) {
+                    hasFn := 1
+                    break
+                }
+            }
+        }
+        require(hasFn, "wrapper bukan OEV");
 
         job.loanToken.forceApprove(wrapper, job.repayAmount);
         IOevWrapper(wrapper).updatePriceEarlyAndLiquidate(

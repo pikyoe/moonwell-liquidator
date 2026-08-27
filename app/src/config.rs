@@ -18,8 +18,9 @@ pub struct Config {
     /// API token Envio HyperSync (dari dashboard Envio / env ENVIO_API_TOKEN).
     #[serde(default)]
     pub hypersync_token: String,
-    /// Optional: whitelist alamat ChainlinkOEVWrapper yang diperiksa untuk event
-    /// UpdatedPrices. Bila kosong, trigger OEV di-nonaktifkan (selalu false).
+    /// Optional: whitelist alamat ChainlinkOEVWrapper yang diperiksa untuk
+    /// event `PriceUpdatedEarlyAndLiquidated`. Bila kosong, trigger OEV
+    /// di-nonaktifkan (selalu false).
     #[serde(default)]
     pub oev_wrappers: Vec<String>,
     pub private_key: String,
@@ -30,7 +31,10 @@ pub struct Config {
     /// Minimum profit GLOBAL dalam unit token HASIL AKHIR (loan token bila
     /// swap aktif, kolateral bila tidak) agar tx dikirim. Dipertahankan untuk
     /// kompatibilitas config lama; lebih baik gunakan `min_profit_per_symbol`.
-    #[serde(default)]
+    /// Default "0" (valid namun serakah) — config yang ada yang menulis
+    /// `min_profit_wei = ""` akan GAGAL parse di startup (fail-fast) supaya
+    /// tidak terkirim tx dengan ambang profit yang tak disengaja.
+    #[serde(default = "default_zero_str")]
     pub min_profit_wei: String,
     /// Minimum profit per simbol market (unit wei token hasil akhir), mengatasi
     /// perbedaan desimal antar token (WETH 18, USDC 6, cbBTC 8). Contoh:
@@ -43,6 +47,12 @@ pub struct Config {
     /// menguras ETH untuk gas. Default 0.0005 ETH.
     #[serde(default = "default_max_gas_cost")]
     pub max_gas_cost_wei: String,
+    /// Priority fee (tip) dalam GWEI agar tx bersaing di mempool Base yang
+    /// sering penuh. 0 = biarkan GasFiller alloy memakai rekomendasi node
+    /// (eth_maxPriorityFeePerGas). Untuk likuidasi yang sensitif-waktu
+    /// sebaiknya set >0 (mis. 0.1–1 gwei) agak lebih agresif dari default.
+    #[serde(default)]
+    pub priority_fee_gwei: u64,
     /// Aktifkan jalur B (classic) sebagai fallback.
     #[serde(default = "default_true")]
     pub classic_fallback: bool,
@@ -96,6 +106,9 @@ fn default_slippage_bps() -> u64 {
 }
 fn default_liquidator_fee_bps() -> u64 {
     3000
+}
+fn default_zero_str() -> String {
+    "0".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

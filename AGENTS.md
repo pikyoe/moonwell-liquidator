@@ -1,9 +1,11 @@
 # Moonwell Liquidator — Repo Knowledge
 
 ## Build & Test
-- Kontrak: `cd contracts && forge build && forge test` (fork test ke Base mainnet via `BASE_RPC_URL`, default publik). Semua 9 test harus lulus.
+- Kontrak: `cd contracts && forge build && forge test` (fork test ke Base mainnet via `BASE_RPC_URL`, default publik). Semua 14 test harus lulus.
 - Bot: `cd app && cargo build` (debug) / `cargo build --release`. Jalankan `cargo clippy` sebelum commit.
-- Test fork terakhir diverifikasi: 11/11 PASS (forge 1.7.1, solc 0.8.24), termasuk 2 e2e happy path (borrower dibuat underwater via mockCall oracle; OEV path diuji dengan FakeOevWrapper yang di-etch ke alamat wrapper asli).
+- Test fork terakhir diverifikasi: 14/14 PASS (forge, solc 0.8.24), termasuk 2 e2e happy path (borrower dibuat underwater via mockCall oracle; OEV path diuji dengan FakeOevWrapper realistis yang di-etch ke alamat wrapper asli — split 30% ke feeRecipient seperti produksi).
+- Fork test meng-unlock `borrowCaps` (guardian `0x08eD…CF05`) dan me-seed cash mUSDC (10M) karena `getCash(mUSDC)=0` di mainnet — jangan hapus helper itu bila tests E2E mulai revert "borrow gagal".
+- RPC berbayar Chainstack tidak menyediakan archive/data-trace: jalankan fork test dengan `BASE_RPC_URL=https://mainnet.base.org` (publik) untuk blok lama; bisa pin blok via `BASE_FORK_BLOCK`.
 
 ## Arsitektur
 - `contracts/src/OevLiquidator.sol` — executor. Flashloan Morpho Blue (0xBBBB...FFCb di Base). Guard callback: `expectedCallHash` hanya diset oleh `execute()` (onlyOwner); callback reject hash tak dikenal.

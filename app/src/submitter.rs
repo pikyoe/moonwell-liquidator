@@ -37,6 +37,24 @@ pub struct Submitter {
     /// Mode dry-run: simulasi eth_call + estimasi gas tetap dijalankan, tapi
     /// transaksi tidak dikirim. Dipakai untuk analisa perilaku tanpa dana.
     dry_run: bool,
+    /// Tip eksplisit per gas (wei) untuk tx bersaing di mempool. `None` =
+    /// pakai rekomendasi node (eth_maxPriorityFeePerGas).
+    priority_fee: Option<u128>,
+}
+
+/// Hasil satu percobaan submit. Dibedakan dari `Err` (transport/infra)
+/// agar fallback Classic bisa dipicu SAAT simulasi OEV revert — kasus paling
+/// umum kegagalan — bukan hanya saat RPC error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// eth_call revert (posisi berubah, wrapper tidak punya fungsi, dll).
+    Reverted,
+    /// Estimasi gas / biaya melebihi batas, gas price tidak terbaca.
+    SkippedBudget,
+    /// Dry-run: simulasi & guard gas lolos, tx tidak dikirim.
+    DryRunOk,
+    /// Transaksi dikirim (receipt diterima).
+    Sent,
 }
 
 /// RAII guard: hapus key dedup saat scope submit berakhir (sukses maupun error).
@@ -59,6 +77,7 @@ impl Submitter {
         flashblocks_endpoint: Option<Url>,
         max_gas_cost: U256,
         dry_run: bool,
+        priority_fee: Option<u128>,
     ) -> Result<Self> {
         let wallet = EthereumWallet::from(signer);
         let provider = ProviderBuilder::new()
@@ -70,28 +89,32 @@ impl Submitter {
             ProviderBuilder::new().wallet(wallet).connect_http(url)
         });
 
-        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()), max_gas_cost, dry_run })
+        Ok(Self { provider, executor, flashblocks, in_flight: std::sync::Arc::new(dashmap::DashSet::new()), max_gas_cost, dry_run, priority_fee })
     }
 
     /// Simulasi dulu; kalau lolos baru kirim transaksi nyata.
-    pub async fn simulate_and_send(&self, job: LiquidationJob) -> Result<()> {
+    /// Kembalian `SendOutcome` membedakan transport-error (`Err`) dari hasil
+    /// fungsional (revert/budget/dry-run/terkirim) supaya main bisa memutuskan
+    /// kapan menjalankan fallback Classic.
+    pub async fn simulate_and_send(&self, job: LiquidationJob) -> Result<SendOutcome> {
         let key = (job.borrower, job.mTokenLoan);
         // Skip bila likuidasi identik sedang in-flight (trigger OEV + scan).
         if !self.in_flight.insert(key) {
             tracing::debug!(?key, "job sedang diproses — duplikat di-skip");
-            return Ok(());
+            return Ok(SendOutcome::DryRunOk);
         }
         let _guard = InFlightGuard { set: self.in_flight.clone(), key };
 
         let contract = IOevLiquidator::new(self.executor, &self.provider);
 
-        // 1. eth_call simulasi — skip bila gagal.
+        // 1. eth_call simulasi — kalau revert, laporkan Reverted agar caller
+        //    bisa mencoba jalur Classic (fallback).
         let sim = contract.execute(job.clone()).call().await;
         match sim {
             Ok(_) => info!("simulasi lolos"),
             Err(e) => {
                 warn!(?e, "simulasi revert — job dibatalkan");
-                return Ok(());
+                return Ok(SendOutcome::Reverted);
             }
         }
 
@@ -105,18 +128,18 @@ impl Submitter {
                     Ok(p) => p,
                     Err(e) => {
                         warn!(?e, "gagal baca gas price — job dibatalkan");
-                        return Ok(());
+                        return Ok(SendOutcome::SkippedBudget);
                     }
                 };
                 let cost = U256::from(gas) * U256::from(gas_price);
                 if cost > self.max_gas_cost {
                     warn!(gas, gas_price, %cost, "estimasi gas melebihi batas — job dibatalkan");
-                    return Ok(());
+                    return Ok(SendOutcome::SkippedBudget);
                 }
             }
             Err(e) => {
                 warn!(?e, "estimasi gas gagal — job dibatalkan");
-                return Ok(());
+                return Ok(SendOutcome::SkippedBudget);
             }
         }
 
@@ -124,28 +147,37 @@ impl Submitter {
         //    tapi tidak ada tx yang dikirim (hanya lapor bahwa job siap kirim).
         if self.dry_run {
             info!("dry-run: simulasi lolos, tx TIDAK dikirim");
-            return Ok(());
+            return Ok(SendOutcome::DryRunOk);
         }
 
         // Bila ada provider flashblocks, kirim lewat endpoint private;
-        // kalau tidak, mempool publik.
+        // kalau tidak, mempool publik. Tip prioritas eksplisit diterapkan
+        // pada CALL BUILDER (sebelum .send()) sehingga GasFiller tidak
+        // menimpa fee yang sudah kita set. Match inline (bukan helper)
+        // agar type inference alloy bisa menyimpulkan P/D yang eksak.
         match self.flashblocks {
             Some(ref fb_provider) => {
                 let fb_contract = IOevLiquidator::new(self.executor, fb_provider);
-                let pending = fb_contract.execute(job).send().await?;
+                let pending = match self.priority_fee {
+                    Some(fee) => fb_contract.execute(job).max_priority_fee_per_gas(fee).send().await?,
+                    None => fb_contract.execute(job).send().await?,
+                };
                 let hash = *pending.tx_hash();
                 info!(?hash, "tx terkirim (private bundle)");
                 let receipt = pending.get_receipt().await?;
                 info!(status = receipt.status(), gas_used = receipt.gas_used, "receipt");
             }
             None => {
-                let pending = contract.execute(job).send().await?;
+                let pending = match self.priority_fee {
+                    Some(fee) => contract.execute(job).max_priority_fee_per_gas(fee).send().await?,
+                    None => contract.execute(job).send().await?,
+                };
                 let hash = *pending.tx_hash();
                 info!(?hash, "tx terkirim (mempool publik)");
                 let receipt = pending.get_receipt().await?;
                 info!(status = receipt.status(), gas_used = receipt.gas_used, "receipt");
             }
         }
-        Ok(())
+        Ok(SendOutcome::Sent)
     }
 }
