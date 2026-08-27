@@ -8,7 +8,7 @@ mod submitter;
 mod swap;
 
 use crate::config::Config;
-use crate::contracts::{IChainlinkOEVWrapper, IComptroller, IMToken, IOevLiquidator, IOracle, Mode, COMPTROLLER};
+use crate::contracts::{IChainlinkOEVWrapper, IComptroller, IMToken, IOevLiquidator, IOracle, LiquidationJob, Mode, COMPTROLLER};
 use crate::health::MarketInfo;
 use crate::indexer::Indexer;
 use crate::state::{AccountState, SharedState};
@@ -110,6 +110,38 @@ async fn main() -> Result<()> {
 
     info!("bot berjalan — memantau blok baru");
 
+    // Submitter non-blocking TUNGGAL untuk seluruh proses: scan reguler & OEV
+    // hanya mengirim job lewat channel (tanpa blok); worker pool melakukan
+    // simulate + send dengan konkurensi terbatas. Dibuat di sini (di luar
+    // loop reconnect) sehingga in-flight submit tidak terpotong saat WS putus.
+    let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel::<LiquidationJob>();
+    {
+        let submitter_t = submitter.clone();
+        let classic_fallback = cfg.classic_fallback;
+        tokio::spawn(async move {
+            futures::stream::unfold(job_rx, |mut rx| async move {
+                rx.recv().await.map(|job| (job, rx))
+            })
+            .for_each_concurrent(4, move |job| {
+                let s = submitter_t.clone();
+                let cfb = classic_fallback;
+                async move {
+                    if let Err(e) = s.simulate_and_send(job.clone()).await {
+                        warn!(?e, "kirim jalur A gagal");
+                        if cfb {
+                            let mut jb = job;
+                            jb.mode = Mode::Classic;
+                            if let Err(e2) = s.simulate_and_send(jb).await {
+                                warn!(?e2, "kirim jalur B gagal");
+                            }
+                        }
+                    }
+                }
+            })
+            .await;
+        });
+    }
+
     // Reconnect WS tanpa batas dengan backoff ringan.
     'outer: loop {
         let stream_result = ws.subscribe_blocks().await;
@@ -122,8 +154,15 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Submitter non-blocking: enqueue di sini, join di akhir.
-        let mut tasks = tokio::task::JoinSet::new();
+        // Task scan yang lahir untuk koneksi ini — di-join saat reconnect
+        // agar tidak leak task.
+        let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+        // Pembatas jumlah scan yang berjalan SEIRING — mencegah satu scan per
+        // blok menumpuk dan meledakkan RPC. Snapshot diambil di bawah lock
+        // singkat, evaluasi latar belakang tidak memegang mutex strategy.
+        let scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
+
         // Catat blok terakhir yang diproses agar rentang terlewat
         // (drop WS / lag subscriber) bisa di-replay.
         let mut last_processed: Option<u64> = None;
@@ -148,13 +187,24 @@ async fn main() -> Result<()> {
             last_processed = Some(number);
 
             // Trigger wrapper OEV — scan langsung tanpa perlu menunggu refresh 10-blok.
+            // Dijalankan non-blocking: tidak men-stall loop blok menunggu scan.
             if !oev_wrappers.is_empty() {
                 match indexer.check_price_trigger(number, &oev_wrappers).await {
                     Ok(true) => {
                         if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
                             warn!(?e, "refresh harga saat trigger OEV gagal");
                         }
-                        spawn_scan(strategy.clone(), submitter.clone(), cfg.clone()).await
+                        let strategy = strategy.clone();
+                        let http = http.clone();
+                        let job_tx = job_tx.clone();
+                        let scan_gate = scan_gate.clone();
+                        tokio::spawn(async move {
+                            let permit = match scan_gate.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => return, // gate ditutup
+                            };
+                            spawn_scan(strategy, http, job_tx, permit).await;
+                        });
                     }
                     Ok(false) => {}
                     Err(e) => warn!(?e, "cek trigger OEV gagal"),
@@ -167,31 +217,26 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // clone config untuk digunakan dalam task
-            let cfg = cfg.clone();
-            let strategy = strategy.clone();
-            let submitter = submitter.clone();
-
-            match strategy.lock().await.scan_opportunities().await {
-                Ok(jobs) => {
-                    for job in jobs {
-                        let submitter = submitter.clone();
-                        let cfg = cfg.clone();
-                        tasks.spawn(async move {
-                            if let Err(e) = submitter.simulate_and_send(job.clone()).await {
-                                warn!(?e, "kirim jalur A gagal");
-                                if cfg.classic_fallback {
-                                    let mut jb = job;
-                                    jb.mode = Mode::Classic;
-                                    if let Err(e2) = submitter.simulate_and_send(jb).await {
-                                        warn!(?e2, "kirim jalur B gagal");
-                                    }
-                                }
-                            }
-                        });
+            // Scan blok ini TANPA memegang mutex strategy: snapshot diambil di
+            // bawah lock singkat lalu evaluasi dijalankan paralel di task
+            // background; hasil dikirim ke worker submitter. Loop blok tidak
+            // menunggu I/O evaluasi.
+            {
+                let strategy = strategy.clone();
+                let http = http.clone();
+                let job_tx = job_tx.clone();
+                let scan_gate = scan_gate.clone();
+                tokio::spawn(async move {
+                    let permit = match scan_gate.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return, // gate ditutup
+                    };
+                    let job = strategy.lock().await.scan(http);
+                    for j in job.run().await {
+                        let _ = job_tx.send(j);
                     }
-                }
-                Err(e) => warn!(?e, "scan gagal"),
+                    drop(permit);
+                });
             }
 
             // prune borrowers yang sudah tidak punya posisi; workaround sederhana
@@ -205,12 +250,13 @@ async fn main() -> Result<()> {
         }
 
         warn!("stream putus — reconnect");
-        tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // tunggu task submitter sebelum reconnect untuk menghindari leak
+        // Tunggu task scan untuk koneksi ini selesai (sendernya di-drop),
+        // agar tidak leak task. Worker submitter global tetap berjalan.
+        tokio::time::sleep(Duration::from_secs(2)).await;
         while let Some(res) = tasks.join_next().await {
             if let Err(e) = res {
-                warn!(?e, "submitter task panic");
+                warn!(?e, "scan task panic");
             }
         }
     }
@@ -300,25 +346,15 @@ async fn refresh_prices<P: Provider + Clone>(
 
 /// Jalankan scan + submit karena trigger UpdatedPrices — terpisah dari task
 /// set reguler blok agar scan trigger tidak harus menunggu iterasi blok baru.
-async fn spawn_scan<P: Provider + Clone>(
+/// Hasil disalurkan ke worker submitter via channel (bukan loop blok).
+async fn spawn_scan<P: Provider + Clone + Send + Sync + 'static>(
     strategy: Arc<Mutex<Strategy<P>>>,
-    submitter: Arc<Submitter>,
-    cfg: Config,
+    provider: P,
+    job_tx: tokio::sync::mpsc::UnboundedSender<LiquidationJob>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    if let Ok(jobs) = strategy.lock().await.scan_opportunities().await {
-        for job in jobs {
-            let submitter = submitter.clone();
-            let cfg = cfg.clone();
-            tokio::spawn(async move {
-                if let Err(e) = submitter.simulate_and_send(job.clone()).await {
-                    warn!(?e, "trigger-OEV kirim jalur A gagal");
-                    if cfg.classic_fallback {
-                        let mut jb = job;
-                        jb.mode = Mode::Classic;
-                        let _ = submitter.simulate_and_send(jb).await;
-                    }
-                }
-            });
-        }
+    let job = strategy.lock().await.scan(provider);
+    for j in job.run().await {
+        let _ = job_tx.send(j);
     }
 }

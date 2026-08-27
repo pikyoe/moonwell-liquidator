@@ -9,6 +9,7 @@
 - `contracts/src/OevLiquidator.sol` — executor. Flashloan Morpho Blue (0xBBBB...FFCb di Base). Guard callback: `expectedCallHash` hanya diset oleh `execute()` (onlyOwner); callback reject hash tak dikenal.
 - Jalur A (OEV): ChainlinkOEVWrapper lewat `comptroller.oracle().getFeed(symbol)`. Jalur B (Classic): `liquidateBorrow` langsung ke mToken.
 - Bot Rust: indexer (event Borrow/Mint/Redeem/Transfer/LiquidateBorrow) → health (HF off-chain) → strategy (bangun LiquidationJob + calldata swap Aerodrome) → submitter (eth_call dulu, baru send). State DashMap in-memory + snapshot.json tiap 100 blok.
+- Konkurensi (Fase 1-2, 2026-08-26): `Strategy::scan(P)` meng-clone semua input (markets/cfg/params) DI BAWAH lock singkat lalu mengembalikan `Arc<ScanJob>` — evaluasi borrower dijalankan paralel (JoinSet + semaphore 8) TANPA memegang mutex strategy. Di `main.rs`, loop blok me-trigger scan via `tokio::spawn` (non-blocking, gate semaphore `scan_gate`=1 agar scan tidak menumpuk per blok); hasil scan mengalir ke worker submitter global (channel unbounded + `for_each_concurrent(4)`) yang dibuat SEKALI di luar loop reconnect. Indexer `watch_block` melakukan refresh akun dengan dedup (market, akun) + konkurensi terbatas (8). Net effect: loop blok tidak pernah menunggu RPC scan/simulate.
 
 ## Alamat on-chain terverifikasi (Base, 2026-08-26)
 - Comptroller: `0xfBb21d0380beE3312B33c4353c8936a0F13EF26C` → oracle `0xEC942bE8A8114bFD0396A5052c36027f2cA6a9d0`
