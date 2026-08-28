@@ -55,8 +55,14 @@ async fn main() -> Result<()> {
     );
     info!(owner = ?signer_addr, executor = ?executor, "kepemilikan executor terverifikasi");
 
-    // Parse whitelist wrapper OEV sekali; errors dicatat tapi tidak fatal.
-    let oev_wrappers: Vec<Address> = cfg
+    let markets = build_market_map(&http, &cfg).await?;
+    info!(count = markets.len(), "market dimuat");
+
+    // Daftar wrapper OEV untuk trigger event: whitelist config + resolve
+    // dinamis dari markets() (fee wrapper yang terbaca on-chain = wrapper
+    // OEV valid). Penyatuan otomatis ini menjaga trigger OEV tetap aktif untuk
+    // SEMUA market yang punya wrapper — bukan hanya yang terdaftar di config.
+    let mut oev_wrappers: Vec<Address> = cfg
         .oev_wrappers
         .iter()
         .filter_map(|s| {
@@ -65,12 +71,18 @@ async fn main() -> Result<()> {
                 .ok()
         })
         .collect();
+    for info in markets.values() {
+        if let Some(feed) = info.oev_wrappers_feed {
+            if !oev_wrappers.contains(&feed) {
+                oev_wrappers.push(feed);
+            }
+        }
+    }
     if !oev_wrappers.is_empty() {
         info!(count = oev_wrappers.len(), "wrapper OEV dipantau untuk PriceUpdatedEarlyAndLiquidated");
+    } else {
+        warn!("oev_wrappers kosong — trigger scan OEV nonaktif (refresh harga 10-blok saja)");
     }
-
-    let markets = build_market_map(&http, &cfg).await?;
-    info!(count = markets.len(), "market dimuat");
 
     let snapshot_path = "snapshot.json";
     let loaded = AccountState::load_snapshot(snapshot_path);
@@ -204,6 +216,12 @@ async fn main() -> Result<()> {
     }
 
     // Reconnect WS tanpa batas dengan backoff ringan.
+    //
+    // MANTAP: «last_processed» DI LUAR loop reconnect — rentang yang
+    // terlewat saat WS putus (bukan sekadar subscriber lag) tetap
+    // di-replay di koneksi berikutnya (fix audit 2026-08-28).
+    let mut last_processed: Option<u64> = None;
+
     'outer: loop {
         let stream_result = ws.subscribe_blocks().await;
         let mut stream = match stream_result {
@@ -230,31 +248,37 @@ async fn main() -> Result<()> {
         // (dan tidak memperebutkan permit yang sama).
         let oev_scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
 
-        // Catat blok terakhir yang diproses agar rentang terlewat
-        // (drop WS / lag subscriber) bisa di-replay.
-        let mut last_processed: Option<u64> = None;
 
         while let Some(block) = stream.next().await {
             let number = block.number;
             info!(number, "blok baru");
 
-            // Replay rentang yang terlewat sejak blok terakhir yang diproses.
+            // Replay rentang yang terlewat — baik dari lag subscriber dalam satu
+            // koneksi maupun gap antar-koneksi (last_processed di luar loop).
+            // PENTING: `watch_block` dipanggil untuk rentang (bukan per blok)
+            // dengan daftar wrapper OEV agar event trigger di rentang gap pun
+            // dihitung (sebelumnya `process_block_logs` memakai &[] sehingga
+            // trigger OEV di replay hilang).
             if let Some(prev) = last_processed {
                 if number > prev + 1 {
-                    if let Err(e) = indexer.process_block_logs(prev + 1, number).await {
-                        warn!(?e, prev, number, "resync rentang gagal");
+                    let from = prev + 1;
+                    if let Err(e) = indexer.watch_block(from, number, &oev_wrappers).await {
+                        warn!(?e, from, number, "resync rentang gagal");
                     }
                 }
             }
 
             // Perbarui posisi semua akun dari event di blok ini + deteksi trigger
             // OEV (PriceUpdatedEarlyAndLiquidated), dalam SATU kueri HyperSync.
-            // Nilai kembalian `true` berarti ada trigger OEV pada blok ini.
+
+            // Nilai kembalian `true` berarti ada trigger OEV pada blok ini..
+
             let oev_trigger = match indexer.watch_block(number, number, &oev_wrappers).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!(?e, number, "gagal memproses log blok");
-                    false
+                    // Jangan catat blok ini sebagai ter-proses: rentang tidak lengkap..
+                    continue;
                 }
             };
             last_processed = Some(number);
@@ -375,17 +399,17 @@ async fn build_market_map<P: Provider>(
         };
         // Fee liquidator OEV dari wrapper yang terdaftar di oracle (bila ada).
         // Config liquidator_fee_bps hanya dipakai sebagai fallback.
-        let oev_fee_bps = match oracle.getFeed(m.symbol.clone()).call().await {
+        let (oev_fee_bps, oev_wrappers_feed) = match oracle.getFeed(m.symbol.clone()).call().await {
             Ok(feed) if feed != Address::ZERO => {
                 match IChainlinkOEVWrapper::new(feed, provider).liquidatorFeeBps().call().await {
-                    Ok(fee) => Some(fee as u64),
+                    Ok(fee) => (Some(fee as u64), Some(feed)),
                     Err(e) => {
                         warn!(?e, symbol = m.symbol, "gagal baca liquidatorFeeBps — pakai config");
-                        None
+                        (None, Some(feed))
                     }
                 }
             }
-            _ => None,
+            _ => (None, None),
         };
         map.insert(
             mtoken,
@@ -396,6 +420,7 @@ async fn build_market_map<P: Provider>(
                 price,
                 protocol_seize_share: seize_share,
                 oev_fee_bps,
+                oev_wrappers_feed,
             },
         );
     }
