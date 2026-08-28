@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
                 .ok()
         })
         .collect();
-    for (info) in markets.values() {
+    for info in markets.values() {
         if let Some(feed) = info.oev_wrappers_feed {
             if !oev_wrappers.contains(&feed) {
                 oev_wrappers.push(feed);

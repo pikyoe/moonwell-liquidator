@@ -283,14 +283,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
 /// Versi bebas (tanpa &self) dari logika swap — dipakai oleh evaluator
 /// (`ScanJob::build_swap`) dan oleh `Strategy::rebuild_classic_job` untuk
 /// fallback OEV->Classic yang menghitung ulang calldata sesuai mode.
-/// Buffer amount_in dalam basis point (dari estimasi sitaan) —
+/// Buffer amount_in & expected_loan_out dalam basis point (dari estimasi
+/// sitaan) — diterapkan sama pada estimasi output agar guard minLoanOut
+/// konsisten dengan input yang di-buffer.
 ///   OEV     : 100% (wrapper updatePriceEarlyAndLiquidate menyegarkan
 ///             harga on-chain tepat sebelum likuidasi, jadi estimasi akurat).
 ///   Classic :  95% (jalur B TIDAK meng-update harga; estimasi memakai
 ///             harga oracle cache (refresh 10-blok. Harga kolateral bisa
 ///             turun sejak refresh → sitaan aktual < estimasi → amount_in yang
 ///             terlalu besar membuat swap revert di router (likuidasi hilang).
-///             Buffer 5% menyerap geseran harga sampai 5%).
+///             Buffer 5% menyerap geseran harga sampai 5%; guard output
+///             ikut di-buffer agar swap tidak revert pada amountOutMin).
 fn amount_in_buffer_bps(mode: Mode) -> u64 {
     match mode {
         Mode::Oev => 10_000,
@@ -347,7 +350,8 @@ fn build_swap_parts(
         // melebihi saldo aktual pasca-split yang bergeser dari harga cache.
         let amount_in = liquidator_usd * one / coll.price
             * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
-        let expected_loan_out = liquidator_usd * one / loan.price;
+        let expected_loan_out = liquidator_usd * one / loan.price
+            * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
 
         let min_out = apply_slippage(expected_loan_out, snap.cfg.swap.slippage_bps);
         let deadline = U256::from(
