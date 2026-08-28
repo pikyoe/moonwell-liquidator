@@ -235,16 +235,37 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await;
                 let m = IMToken::new(market, &provider);
-                if let Ok(snap) = m.getAccountSnapshot(account).call().await {
-                    state.upsert_or_remove(
-                        account,
-                        market,
-                        crate::state::Position {
-                            mtoken_balance: snap.mTokenBalance,
-                            borrow_balance: snap.borrowBalance,
-                            exchange_rate: snap.exchangeRateMantissa,
-                        },
-                    );
+                let mut attempt = 0u32;
+                loop {
+                    match m.getAccountSnapshot(account).call().await {
+                        Ok(snap) => {
+                            state.upsert_or_remove(
+                                account,
+                                market,
+                                crate::state::Position {
+                                    mtoken_balance: snap.mTokenBalance,
+                                    borrow_balance: snap.borrowBalance,
+                                    exchange_rate: snap.exchangeRateMantissa,
+                                },
+                            );
+                            break;
+                        }
+                        Err(e) if attempt < 2 => {
+                            attempt += 1;
+                            warn!(
+                                ?e, ?account, ?market, attempt,
+                                "refresh snapshot gagal — coba ulang"
+                            );
+                            tokio::time::sleep(Duration::from_millis(200u64 << attempt)).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                ?e, ?account, ?market,
+                                "refresh snapshot gagal — state tetap basi (akan disegarkan event berikutnya)"
+                            );
+                            break;
+                        }
+                    }
                 }
             });
         }

@@ -276,19 +276,35 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         repay: U256,
         mode: Mode,
     ) -> Result<(Address, alloy::primitives::Bytes, U256)> {
-        build_swap_parts(snap, loan, coll, repay, mode)
+        build_swap_parts(snap, loan, coll, repay, mode, amount_in_buffer_bps(mode))
     }
 }
 
 /// Versi bebas (tanpa &self) dari logika swap — dipakai oleh evaluator
 /// (`ScanJob::build_swap`) dan oleh `Strategy::rebuild_classic_job` untuk
 /// fallback OEV->Classic yang menghitung ulang calldata sesuai mode.
+/// Buffer amount_in dalam basis point (dari estimasi sitaan) —
+///   OEV     : 100% (wrapper updatePriceEarlyAndLiquidate menyegarkan
+///             harga on-chain tepat sebelum likuidasi, jadi estimasi akurat).
+///   Classic :  95% (jalur B TIDAK meng-update harga; estimasi memakai
+///             harga oracle cache (refresh 10-blok. Harga kolateral bisa
+///             turun sejak refresh → sitaan aktual < estimasi → amount_in yang
+///             terlalu besar membuat swap revert di router (likuidasi hilang).
+///             Buffer 5% menyerap geseran harga sampai 5%).
+fn amount_in_buffer_bps(mode: Mode) -> u64 {
+    match mode {
+        Mode::Oev => 10_000,
+        Mode::Classic => 9_500,
+    }
+}
+
 fn build_swap_parts(
     snap: &ScanSnapshot,
     loan: &MarketInfo,
     coll: &MarketInfo,
     repay: U256,
     mode: Mode,
+    amount_in_buffer_bps: u64,
 ) -> Result<(Address, alloy::primitives::Bytes, U256)> {
         let zero: alloy::primitives::Bytes = Default::default();
         if !snap.cfg.swap.enabled || loan.underlying == coll.underlying {
@@ -327,7 +343,10 @@ fn build_swap_parts(
         };
 
         // konversi ke unit underlying kolateral & estimasi hasil dalam loanToken
-        let amount_in = liquidator_usd * one / coll.price;
+        // amount_in dikurangi buffer (lihat amount_in_buffer_bps) agar tidak
+        // melebihi saldo aktual pasca-split yang bergeser dari harga cache.
+        let amount_in = liquidator_usd * one / coll.price
+            * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
         let expected_loan_out = liquidator_usd * one / loan.price;
 
         let min_out = apply_slippage(expected_loan_out, snap.cfg.swap.slippage_bps);
@@ -463,7 +482,14 @@ impl<P> Strategy<P> {
 
         if self.cfg.swap.enabled && loan.underlying != coll.underlying {
             let (swap_target, swap_data, min_loan_out) =
-                build_swap_parts(&self.snapshot_local(), loan, coll, job.repayAmount, Mode::Classic)?;
+                build_swap_parts(
+                    &self.snapshot_local(),
+                    loan,
+                    coll,
+                    job.repayAmount,
+                    Mode::Classic,
+                    amount_in_buffer_bps(Mode::Classic),
+                )?;
             new_job.swapTarget = swap_target;
             new_job.swapData = swap_data;
             new_job.minLoanOut = min_loan_out;
@@ -532,6 +558,7 @@ min_profit_wei = "1000"
                 price: U256::from(10u64.pow(18)).pow(U256::from(2)), // 1e36
                 protocol_seize_share: U256::from(3 * 10u64.pow(16)),
                 oev_fee_bps: Some(3000),
+                oev_wrappers_feed: None,
             },
         );
         markets.insert(
@@ -543,6 +570,7 @@ min_profit_wei = "1000"
                 price: U256::from(2000u64) * U256::from(10u64.pow(18)).pow(U256::from(2)), // 2000e36
                 protocol_seize_share: U256::from(3 * 10u64.pow(16)),
                 oev_fee_bps: Some(3000),
+                oev_wrappers_feed: None,
             },
         );
 
@@ -566,8 +594,20 @@ min_profit_wei = "1000"
         // repay ~ $10.000 di mUSDC, collateral mWETH.
         let repay = U256::from(10_000u64) * U256::from(10u64.pow(6)); // USDC 6 desimal
 
-        let oev = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Oev).unwrap();
-        let classic = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Classic).unwrap();
+        let oev = build_swap_parts(
+            &snap,
+            &snap.markets[&addr(1)],
+            &snap.markets[&addr(2)],
+            repay,
+            Mode::Oev,
+            amount_in_buffer_bps(Mode::Oev),).unwrap();
+        let classic = build_swap_parts(
+            &snap,
+            &snap.markets[&addr(1)],
+            &snap.markets[&addr(2)],
+            repay,
+            Mode::Classic,
+            amount_in_buffer_bps(Mode::Classic),).unwrap();
 
         // amount_in dalam wei WETH (18 des). Classic > OEV karena split penuh.
         assert!(
@@ -586,7 +626,13 @@ min_profit_wei = "1000"
         let mut snap = snapshot();
         snap.cfg.swap.enabled = false;
         let repay = U256::from(10_000u64) * U256::from(10u64.pow(6));
-        let out = build_swap_parts(&snap, &snap.markets[&addr(1)], &snap.markets[&addr(2)], repay, Mode::Classic).unwrap();
+        let out = build_swap_parts(
+            &snap,
+            &snap.markets[&addr(1)],
+            &snap.markets[&addr(2)],
+            repay,
+            Mode::Classic,
+            amount_in_buffer_bps(Mode::Classic),).unwrap();
         assert_eq!(out.0, Address::ZERO);
         assert_eq!(out.1.len(), 0);
         assert_eq!(out.2, U256::ZERO);

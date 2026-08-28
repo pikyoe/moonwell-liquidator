@@ -40,3 +40,13 @@
 - Fallback OEV->Classic TIDAK boleh hanya membalik `job.mode`: swapData/minLoanOut/minProfit dibangun ulang utk mode Classic via `Strategy::rebuild_classic_job` (Classic men-redeem seluruh sitaan = 100% profit, bukan split OEV 30%). Logika swap di free fn `build_swap_parts` (dipakai evaluator & rebuild).
 - Selector OEV `0x16bb3b3a` discan cukup di 256 byte pertama runtime code wrapper (daerah dispatcher; verified offset 54 utk wrapper WETH Base) — bukan seluruh bytecode. Scan per-byte (dispatcher Solidity memakai PUSH4 offset 4-byte-aligned, bukan 32-byte-aligned — gitar-bot#3). Buffer copy 288B agar mload aman.
 - Verifikasi akhir: forge 16/16 PASS, cargo 15/15 PASS, clippy 0 warning.
+
+## Audit 2026-08-28 (sesi audit lanjutan — fix tanpa eksekusi test)
+- 🔴 Reconnect gap: `last_processed` sekarang DI LUAR loop reconnect — rentang yang terlewat saat WS putus di-replay di koneksi berikutnya (sebelumnya nol→borrower basi & trigger OEV di gap hilang).
+- 🟠 Trigger OEV otomatis: daftar `oev_wrappers` kini = whitelist config + hasil resolve dinamis `MarketInfo.oev_wrappers_feed` (feed yang `liquidatorFeeBps()` terbaca = wrapper valid). Replay gap juga memakai wrapper (bukan `&[]` yang menonaktifkan trigger).
+- 🟠 Refresh akun kini retry 2x + backoff kecil + `warn!` saat gagal — tidak lagi diam ( state basi & prune akun aktif senyap).
+- 🟠 `ENVIO_API_TOKEN` kini dibaca dari env (default serde) — komentar lama sudah benar.
+
+- 🟡 Buffer amount_in Classic 95% (`amount_in_buffer_bps`: OEV 10000, Classic 9500) — jalur B tidak meng-update harga; sitaan aktual bisa < estimasi dari harga cache → buffer mencegah swap revert.
+
+- Catatan: perubahan ini TIDAK dieksekusi test di sesi ini(lingkup static); jalankan `forge test` + `cargo test` + `clippy` sebelum merge (seperti biasa).

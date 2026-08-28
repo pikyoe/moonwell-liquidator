@@ -14,6 +14,9 @@ pub struct MarketInfo {
     pub protocol_seize_share: U256,
     /// Fee liquidator OEV (bps) dibaca on-chain dari wrapper; None = pakai config.
     pub oev_fee_bps: Option<u64>,
+    /// Alamat feed OEV yang ter-resolve via `oracle.getFeed(symbol)`(bila ada).
+    /// Dipakai untuk menurunkan daftar wrapper yang dipantau trigger event.
+    pub oev_wrappers_feed: Option<Address>,
 }
 
 impl MarketInfo {
@@ -88,6 +91,7 @@ mod tests {
             price,
             protocol_seize_share: U256::ZERO,
             oev_fee_bps: None,
+            oev_wrappers_feed: None,
         }
     }
 

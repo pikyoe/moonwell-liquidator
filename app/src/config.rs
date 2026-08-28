@@ -16,7 +16,7 @@ pub struct Config {
     #[serde(default = "default_hypersync_url")]
     pub hypersync_url: String,
     /// API token Envio HyperSync (dari dashboard Envio / env ENVIO_API_TOKEN).
-    #[serde(default)]
+    #[serde(default = "default_hypersync_token")]
     pub hypersync_token: String,
     /// Optional: whitelist alamat ChainlinkOEVWrapper yang diperiksa untuk
     /// event `PriceUpdatedEarlyAndLiquidated`. Bila kosong, trigger OEV
@@ -194,6 +194,9 @@ impl Config {
 
 fn default_hypersync_url() -> String {
     "https://base.hypersync.xyz".into()
+}
+fn default_hypersync_token() -> String {
+    std::env::var("ENVIO_API_TOKEN").unwrap_or_default()
 }
 fn default_max_position() -> u64 {
     25_000
