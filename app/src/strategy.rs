@@ -566,6 +566,13 @@ impl<P> Strategy<P> {
             info.price = price;
         }
     }
+
+    /// Snapshot markets ter-lock saat ini (harga terbaru hasil refresh_prices),
+    /// dipakai pemanggil yang butuh MarketInfo segar tanpa memegang lock lama
+    /// (mis. sweep_marginal_borrowers) — clone di bawah lock singkat, tanpa I/O.
+    pub fn markets_snapshot(&self) -> HashMap<Address, MarketInfo> {
+        self.markets.clone()
+    }
 }
 
 #[cfg(test)]
