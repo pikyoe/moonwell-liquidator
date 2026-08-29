@@ -308,10 +308,13 @@ async fn main() -> Result<()> {
                 });
             }
 
-            if number % 10 == 0 {
-                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
-                    warn!(?e, "refresh harga gagal");
-                }
+            // Harga di-refresh TIAP blok (bukan 10-blok): evaluator & submitter
+            // selalu memakai harga segar, sehingga estimasi amount_in/minProfit
+            // tidak basi di tengah blok yang volatile..
+            // Satu panggilan ini tetap murah — refresh_prices hanya N call, dan tanpa
+            // memegang mutex saat network I/O (harga dikumpulkan di luar kunci)..
+            if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+                warn!(?e, "refresh harga gagal");
             }
 
             // Scan blok ini TANPA memegang mutex strategy: snapshot diambil di
