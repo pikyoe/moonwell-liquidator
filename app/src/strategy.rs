@@ -576,8 +576,9 @@ impl<P> Strategy<P> {
         }
     }
 
-    /// Snapshot markets terkini (harga sudah di-refresh oleh refresh_prices) —
-    /// dipakai sweep akun marginal agar klasifikasi HF tidak memakai harga beku.
+    /// Snapshot markets ter-lock saat ini (harga terbaru hasil refresh_prices),
+    /// dipakai pemanggil yang butuh MarketInfo segar tanpa memegang lock lama
+    /// (mis. sweep_marginal_borrowers) — clone di bawah lock singkat, tanpa I/O.
     pub fn markets_snapshot(&self) -> HashMap<Address, MarketInfo> {
         self.markets.clone()
     }

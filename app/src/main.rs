@@ -360,14 +360,15 @@ async fn main() -> Result<()> {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    // Refresh harga + ambil snapshot markets DI DALAM task agar loop
-                    // blok tidak menunggu I/O RPC sweep (dan sweep memakai harga
-                    // terkini dari strategy, bukan map startup yang beku).
+                    // Refresh harga DI DALAM task agar loop blok tidak menunggu
+                    // I/O RPC sweep.
                     if let Err(e) = refresh_prices(&http_sweep, &cfg_sweep, strategy_sweep.clone()).await {
                         warn!(?e, "refresh harga saat sweep gagal");
                     }
-                    let markets_fresh = strategy_sweep.lock().await.markets_snapshot();
-                    if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_fresh, threshold).await {
+                    // Ambil snapshot markets SETELAH refresh agar sweep menilai
+                    // HF pakai harga terbaru, bukan harga saat startup.
+                    let markets_sweep = strategy_sweep.lock().await.markets_snapshot();
+                    if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_sweep, threshold).await {
                         warn!(?e, "sweep akun marginal gagal");
                     }
                     drop(permit);
