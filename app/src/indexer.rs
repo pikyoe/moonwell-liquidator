@@ -211,7 +211,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         for (i, (_, _, account, market))in snapshot_calls.iter().enumerate() {
 
             let idx = accrue_calls.len() + i;
-            if !results[idx].success {
+            let accrue_idx = accrue_calls.iter().position(|(m, _)| m == market).unwrap();
+            if !results[accrue_idx].success || !results[idx].success {
                 warn!(?account, ?market, "accrue+snapshot sweep gagal — state dibiarkan");
                 continue;
             }
