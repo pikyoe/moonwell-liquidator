@@ -261,8 +261,8 @@ async fn main() -> Result<()> {
             // koneksi maupun gap antar-koneksi (last_processed di luar loop).
             // PENTING: `watch_block` dipanggil untuk rentang (bukan per blok)
             // dengan daftar wrapper OEV agar event trigger di rentang gap pun
-            // dihitung (sebelumnya `process_block_logs` memakai &[] sehingga
-            // trigger OEV di replay hilang).
+            // dihitung (sebelumnya replay memakai `&[]` sehingga trigger OEV
+            // di rentang gap hilang).
             if let Some(prev) = last_processed {
                 if number > prev + 1 {
                     let from = prev + 1;
@@ -362,7 +362,6 @@ async fn main() -> Result<()> {
                     };
                     // Refresh harga DI DALAM task agar loop blok tidak menunggu
                     // I/O RPC sweep.
-
                     if let Err(e) = refresh_prices(&http_sweep, &cfg_sweep, strategy_sweep.clone()).await {
                         warn!(?e, "refresh harga saat sweep gagal");
                     }

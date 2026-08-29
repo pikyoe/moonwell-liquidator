@@ -263,15 +263,6 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
         Ok(())
     }
 
-    /// Proses rentang blok — decode **semua** event posisi (Mint/Redeem/Borrow/
-    /// Repay/Liquidate/Transfer), dipakai untuk replay rentang yang terlewat
-    /// saat reconnect WS.
-    ///
-    /// Tanpa `oev_wrappers` (replay/backfill) tidak ada sinyal trigger OEV.
-    pub async fn process_block_logs(&self, from_block: u64, to_block: u64) -> Result<()> {
-        self.watch_block(from_block, to_block, &[]).await.map(|_| ())
-    }
-
     /// Handler satu blok / rentang blok. Dipanggil per blok di main loop dan juga
     /// untuk mem-replay rentang yang terlewat saat reconnect WS.
     ///
