@@ -1,5 +1,6 @@
 mod config;
 mod contracts;
+mod flashblocks;
 mod health;
 mod hypersync;
 mod indexer;
@@ -15,12 +16,13 @@ use crate::indexer::Indexer;
 use crate::state::{AccountState, SharedState};
 use crate::strategy::Strategy;
 use crate::submitter::Submitter;
+use crate::flashblocks::{run_flashblocks_monitor, run_mempool_monitor, FastSignal};
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use futures::StreamExt;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, time::{Duration, Instant}};
 use std::str::FromStr;
 use tokio::sync::Mutex;
 use std::sync::Arc;
@@ -214,6 +216,118 @@ async fn main() -> Result<()> {
             .await;
         });
     }
+
+    // --- Sinyal cepat: Flashblocks (preconfirmation ~200 ms) & mempool ---
+    // Dua pemantau WS berjalan sebagai task independen (reconnect sendiri,
+    // backoff tertutup); keduanya mengirim [`FastSignal`] ke channel ini..
+    // Penerima di bawah (di luar loop reconnect) men-debounce & memicu
+    // refresh harga + scan cepat dengan pola yang sama seperti trigger OEV.
+    let mut watch_addrs: Vec<Address> = cfg.market_addresses()?;
+    watch_addrs.push(COMPTROLLER);
+    watch_addrs.push(executor;
+    watch_addrs.extend(oev_wrappers.iter().copied());
+    // Executor mendelegasi penuh ke owner — pantau owner juga agar tx langsung
+    // ke executor (yang butuh owner) tetap kelihatan lewat `from`+selector..
+
+    watch_addrs.push(signer_addr;
+    watch_addrs.sort_unstable();
+    watch_addrs.dedup();
+
+    let (fast_tx, fast_rx) = tokio::sync::mpsc::unbounded_channel::<FastSignal>();
+    let selectors = crate::flashblocks::watch_selectors();
+
+    if let Some(fb_ws) = cfg.flashblocks_ws.clone() {
+        let fb_tx = fast_tx.clone();
+        let addrs = watch_addrs.clone();
+        let sels = selectors.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_flashblocks_monitor(fb_ws, addrs, sels, fb_tx.await {
+                warn!(?e, "monitor flashblocks berhenti");
+            }
+        });
+    }
+
+    if cfg.mempool_enabled {
+        let mp_ws = cfg
+            .mempool_ws
+            .clone()
+            .or_else(|| cfg.flashblocks_ws.clone())
+            .unwrap_or_else(|| cfg.base_rpc_ws.clone());
+        let mp_tx = fast_tx.clone();
+        let addrs = watch_addrs.clone();
+        let sels = selectors.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_mempool_monitor(mp_ws, addrs, sels, mp_tx.await {
+                warn!(?e, "monitor mempool berhenti");
+            }
+        });
+    }
+
+    // Penerima sinyal cepat — loop independen (di luar loop reconnect blok).
+    // Debounce event burst dalam satu flashblock; scan cepat memakai gate
+    // sendiri (bukan `scan_gate`/`oev_scan_gate`) agar tidak merebutkan permit,
+    // namun tetap try-acquire biar satu-satu scan cepat bersamaan. Sinyal
+    // pada akun yang tidak dikenal state TIDAK memicu scan (hemat RPC):
+    // akun baru akan tertangkap oleh refresh event biasa / bootstrap.. KECUALI
+    // sinyal itu likuidasi kompetitor — kita BUKAN menunggu akun dikenal (lihat
+    // jalur khusus di bawah) untuk bereaksi kejadian yang sudah terjadi..
+
+    let flash_gate = Arc::new(tokio::sync::Semaphore::new(1);
+    let strategy_fast = strategy.clone();
+    let http_fast = http.clone();
+    let cfg_fast = cfg.clone();
+    let job_tx_fast = job_tx.clone();
+    let state_fast = state.clone();
+    tokio::spawn(async move {
+        let mut last_scan = None::<Instant>;
+        let debounce_ms = Duration::from_millis(cfg_fast.fast_signal_debounce_ms.max(1);
+        let signer_addr_scan = signer_addr;
+        while let Some(sig) = fast_rx.recv().await {
+            // Tx yang kita kirim sendiri (dari submitter public-RPC, non-private)
+            // tidak perlu memicu scan ulang — skip cepat.
+
+            if let FastSignal::Tx { from, .. } = &sig {
+                if *from == signer_addr_scan {
+                    continue;
+                }
+            }
+            // Likuidasi kompetitor (lewat mempool) SELALU diproses — bahkan
+            // untuk borrower yang belum dikenal state: kompetisi menandakan posisi
+            // yang relevan sedang terjadi sekarang, dan refresh+scan perlu
+            // dilakukan secepatnya..
+
+            if !sig.is_competitor_liquidation() {
+                if let Some(b) = sig.borrower() {
+                    if state_fast.borrowers.get(&b).is_none() {
+                        tracing::debug!(sig = ?sig, "sinyal akun tak dikenal — di-skip");
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(t) = last_scan {
+                if t.elapsed() < debounce_ms {
+                    continue;
+                }
+            }
+            last_scan = Some(Instant::now());
+
+            if let Err(e) = refresh_prices(&http_fast, &cfg_fast, strategy_fast.clone().await {
+                warn!(?e, "refresh harga sinyal cepat gagal");
+            }
+            let s = strategy_fast.clone();
+            let p = http_fast.clone();
+            let jt = job_tx_fast.clone();
+            let gate = flash_gate.clone();
+            tokio::spawn(async move {
+                let permit = match gate.try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => return, // scan cepat lain sedang jalan — lewati
+                };
+                spawn_scan(s, p, jt, permit.await;
+            });
+        }
+    });
 
     // Reconnect WS tanpa batas dengan backoff ringan.
     //
