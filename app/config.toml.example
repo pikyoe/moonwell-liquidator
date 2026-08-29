@@ -47,6 +47,18 @@ priority_fee_gwei = 0
 # fallback jalur B
 classic_fallback = true
 
+# Interval blok untuk sweep akun marginal-safe (staleness bunga). `getAccountSnapshot`
+# view TIDAK memicu accrueInterest(), jadi borrower yang HF cached-nya "safe tipis"
+# bisa sudah underwater secara matematis tapi tidak kelihatan sampai ada event refresh.
+# Sweep meng-accrue tiap market + snapshot semua kandidat dalam SATU batch
+# Multicall3 (eth_call simulasi, bukan tx asli). 0 = nonaktif.
+
+sweep_interval_blocks = 25
+# Ambang HF (skala 1e18) untuk sweep: akun dengan cached HF di bawah ambang
+# (tapi >= 1) disegarkan paksa. Default 1.05e18.
+
+sweep_hf_threshold_scaled ="1050000000000000000"
+
 [swap]
 enabled = true
 router  = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"  # Aerodrome Router (Base)

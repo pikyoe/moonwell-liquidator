@@ -1,9 +1,10 @@
 use crate::config::Config;
-use crate::contracts::{IComptroller, IMToken, LiquidationJob, Mode, COMPTROLLER};
+use crate::contracts::{IComptroller, IMToken, IMulticall3, LiquidationJob, Mode, MULTICALL3, COMPTROLLER};
 use crate::health::{classify, health_factor, Health, MarketInfo};
 use crate::state::{Position, SharedState};
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
 use alloy::primitives::{Address, U256};
+use alloy::sol_types::SolCall;
 use alloy::providers::Provider;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -158,10 +159,43 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         drop(positions);
 
         // Refresh posisi kandidat di kedua market — snapshot state bisa basi
-        // (bunga terakru, likuidasi lain). Bangun job dari data segar.
-        for market in [mloan, mcoll] {
-            let mtoken = IMToken::new(market, &self.provider);
-            match mtoken.getAccountSnapshot(borrower).call().await {
+        // (bunga terakru, likuidasi lain). Bangun job dari data segar. Kedua
+        // market di-accrue-dulu dalam SATU batch + snapshot borrower —
+        // `getAccountSnapshot` view TIDAK meng-accrue bunga, jadi state
+        // on-chain yang di-accrue lewat `Multicall3` memberi nilai eksak
+        // (bukan proyeksi off-chain) sambil hanya 1 round-trip RPC.
+        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+        for &market in &[mloan, mcoll] {
+            calls.push(IMulticall3::Call3 {
+                target: market,
+                allowFailure: true,
+                callData: IMToken::accrueInterestCall { }.abi_encode().into(),
+            });
+        }
+        for &market in &[mloan, mcoll] {
+            calls.push(IMulticall3::Call3 {
+                target: market,
+                allowFailure: true,
+                callData: IMToken::getAccountSnapshotCall { account: borrower }.abi_encode().into(),
+            });
+        }
+        let mcall = IMulticall3::new(MULTICALL3, &self.provider);
+        let res = mcall.aggregate3(calls).call().await?;
+        if res.len() != 4 {
+            warn!(
+                ?borrower, got = res.len(),
+                "refresk kandidat multicall tidak lengkap — skip"
+            );
+            return Ok(None);
+        }
+        for (i, market)in [mloan, mcoll].into_iter().enumerate() {
+            let acc = &res[i];
+            let r = &res[2 + i];
+            if !acc.success || !r.success {
+                warn!(?borrower, ?market, "accrue+snapshot kandidat gagal — skip");
+                return Ok(None);
+            }
+            match IMToken::getAccountSnapshotCall::abi_decode_returns(&r.returnData) {
                 Ok(s) => snap.state.upsert_or_remove(
                     borrower,
                     market,
@@ -172,7 +206,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                     },
                 ),
                 Err(e) => {
-                    warn!(?borrower, ?market, ?e, "refresh kandidat gagal — skip");
+                    warn!(?borrower, ?market, ?e, "decode snapshot kandidat gagal — skip");
                     return Ok(None);
                 }
             }
@@ -298,6 +332,9 @@ fn amount_in_buffer_bps(mode: Mode) -> u64 {
     match mode {
         Mode::Oev => 10_000,
         Mode::Classic => 9_500,
+        // `sol!` menambah varian sentinel `__Invalid` untuk nilai enum tak dikenal.
+
+        Mode::__Invalid => 9_500,
     }
 }
 
@@ -350,8 +387,12 @@ fn build_swap_parts(
         // melebihi saldo aktual pasca-split yang bergeser dari harga cache.
         let amount_in = liquidator_usd * one / coll.price
             * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
-        let expected_loan_out = liquidator_usd * one / loan.price
-            * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
+        // expected_loan_out TIDAK di-buffer: buffer input hanya mencegah
+        // amount_in melebihi saldo aktual pasca-split (harga cache bisa turun);
+        // menjanjikan loan_out berdasarkan buffer yang sama membuat Classical
+        // menjanjikan LEBIH SEDIKIT padahal men-redeem sitaan penuh (membalikkan
+        // maksud fallback OEV->Classic — lihat test rebuild_classic_amount_in_lebih_besar_dari_oev).
+        let expected_loan_out = liquidator_usd * one / loan.price;
 
         let min_out = apply_slippage(expected_loan_out, snap.cfg.swap.slippage_bps);
         let deadline = U256::from(

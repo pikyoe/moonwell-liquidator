@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     }
 
     let strategy = Arc::new(tokio::sync::Mutex::new(
-        Strategy::new(http.clone(), state.clone(), cfg.clone(), markets)?,
+        Strategy::new(http.clone(), state.clone(), cfg.clone(), markets.clone())?,
     ));
     // Muat harga + param comptroller sekali di start agar close_factor tidak nol
     // di scan pertama.
@@ -334,6 +334,27 @@ async fn main() -> Result<()> {
                     drop(permit);
                 });
             }
+
+            // Sweep akun marginal-safe (staleness bunga): refresh paksa lewat
+            // accrue-fresh — `getAccountSnapshot` view TIDAK meng-accrue, jadi
+            // borrower yang HF cached-nya "safe tipis" bisa sudah underwater
+            // secara matematis tapi belum kelihatan sampai ada event yang me-refreshnya.
+            // Non-blocking: di-spawn agar loop blok tidak menunggu RPC sweep.
+
+            if cfg.sweep_interval_blocks > 0 && number % cfg.sweep_interval_blocks == 0 {
+                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
+                    warn!(?e, "refresh harga saat sweep gagal");
+                }
+                let indexer_sweep = indexer.clone();
+                let markets_sweep = markets.clone();
+                let threshold = cfg.sweep_hf_threshold_scaled;
+                tasks.spawn(async move {
+                    if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_sweep, threshold).await {
+                        warn!(?e, "sweep akun marginal gagal");
+                    }
+                });
+            }
+
 
             // prune borrowers yang sudah tidak punya posisi; workaround sederhana
             // dengan melakukannya tiap 100 blok (sejalan snapshot).

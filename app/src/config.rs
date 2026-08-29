@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -78,6 +78,26 @@ pub struct Config {
     /// pada jendela non-archive lalu bot lanjut live.
     #[serde(default = "default_bootstrap_depth")]
     pub bootstrap_depth_blocks: u64,
+    /// Interval blok untuk sweep akun marginal-safe (staleness bunga).
+    /// `getAccountSnapshot` di fork Compound v2/Moonwell TIDAK memicu
+    /// `accrueInterest()` — nilai yang dibaca adalah checkpoint terakhir kali
+    /// market disentuh. Akun yang HF cached-nya "safe tipis" bisa saja
+    /// sudah underwater secara matematis (bunga berjalan tiap blok, tapi
+    /// state on-chain belum di-accrue). Sweep ini memanggil `accrueInterest()`
+    /// sekali per market lalu `getAccountSnapshot` per akun — semua dalam SATU
+    /// batch Multicall3 (eth_call deterministik, meng-accrue state on-chain
+    /// hanya di dalam simulasi eth_call). 0 = nonaktif.
+
+    #[serde(default = "default_sweep_interval")]
+    pub sweep_interval_blocks: u64,
+    /// Ambang HF (1e18 scaled) untuk acuan sweep: akun dengan cached HF
+    /// di bawah ambang ini (tapi masih >= 1, tidak liquidatable) disegarkan
+    /// paksa lewat accrue-fresh agar tidak ada peluang yang "lewat" gara-gara
+    /// state basi. Akun dengan HF < 1 (sudah liquidatable) pasti di-refresh
+    /// oleh jalur evaluasi biasa. Default 1.05 — hanya akun yang memang
+    /// mepet yang kena biaya RPC sweep ini.
+    #[serde(default = "default_sweep_hf_threshold")]
+    pub sweep_hf_threshold_scaled: U256,
     /// Swap aktif (opsional). Router & calldata diisi di strategi.
     #[serde(default)]
     pub swap: SwapConfig,
@@ -209,6 +229,12 @@ fn default_true() -> bool {
 }
 fn default_bootstrap_depth() -> u64 {
     2_000
+}
+fn default_sweep_interval() -> u64 {
+    25
+}
+fn default_sweep_hf_threshold() -> U256 {
+    U256::from(105u64) * U256::from(10u64.pow(16)) // 1.05e18
 }
 fn default_eval_concurrency() -> usize {
     2

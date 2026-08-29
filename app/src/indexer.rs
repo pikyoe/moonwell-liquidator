@@ -1,10 +1,12 @@
-use crate::contracts::IMToken;
+use crate::contracts::{IMToken, IMulticall3, MULTICALL3};
+use crate::health::{health_factor, MarketInfo};
 use crate::hypersync::HyperSync;
-use crate::state::SharedState;
-use alloy::primitives::Address;
+use crate::state::{Position, SharedState};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -37,6 +39,7 @@ alloy::sol! {
     );
 }
 
+#[derive(Clone)]
 pub struct Indexer<P: Provider> {
     provider: P,
     hyper: HyperSync,
@@ -119,6 +122,117 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
             }
         }
         info!(count = self.state.borrowers().len(), "bootstrap selesai");
+        Ok(())
+    }
+
+    /// Sweep akun marginal-safe: refresh paksa lewat accrue-fresh agar
+    /// staleness bunga (getAccountSnapshot TIDAK meng-accrue) tidak
+    /// menyembunyikan borrower yang sebenarnya sudah underwater. Kerja:
+    /// (1) kumpulkan akun yang cached HF-nya di bawah ambang (marginal,
+    /// belum liquidatable) dari state off-chain;
+    /// (2) dalam SATU kueri `Multicall3::aggregate3`, panggil
+    /// `accrueInterest()` sekali per market DIKUTI `getAccountSnapshot`
+    /// per (akun, market) — di dalam eth_call simulasi, accrue ditulis ke
+    /// state transaksi dan snapshot-snapshot berikutnya membaca state segar;
+    /// (3) decode hasil batch dan upsert ke state. Jadi 1 round-trip RPC
+    /// menyegarkan semua kandidat mepet, tanpa proyeksi bunga manual.
+    /// hf_threshold (dari config) menentukan siapa "marginal"; MarketInfo
+    /// dibutuhkan untuk menilai HF dari state cached — harus konsisten
+    pub async fn sweep_marginal_borrowers(
+        &self,
+        markets: HashMap<Address, MarketInfo>,
+        hf_threshold: U256,
+    ) -> Result<()> {
+        let borrowed: Vec<Address> = self.state.borrowers();
+        let mut candidates: Vec<(Address, Vec<Address>)> = Vec::new();
+        for account in borrowed {
+            let Some(positions) = self.state.positions.get(&account) else { continue };
+            let mut tuples = Vec::new();
+            for m in positions.iter() {
+                tuples.push((*m.key(), m.mtoken_balance, m.borrow_balance, m.exchange_rate));
+            }
+            let (_, _, hf) = health_factor(&tuples, &markets);
+            // < ambang (termasuk yang sudah liquidatable) disegarkan paksa;
+            // yang >= ambang dibiarkan ke refresh berbasis event biasa.
+
+            if hf < hf_threshold && hf != U256::MAX {
+                let mut mlist = Vec::new();
+                for m in positions.iter() {
+                    mlist.push(*m.key());
+                }
+                candidates.push((account, mlist));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Bangun batch: accrue per market unik dulu (agar tiap snapshot
+        // melihat state ter-accrue dalam batch yang sama), lalu snapshot per akun.
+
+        let mut accrue_calls: Vec<(Address, Vec<u8>)> = Vec::new();
+        let mut snapshot_calls: Vec<(Address, Vec<u8>, Address, Address)> = Vec::new(); // (target, data, account, market)
+        for (account, mlist) in &candidates {
+            for &market in mlist {
+                if !accrue_calls.iter().any(|(m, _)| *m == market) {
+                    accrue_calls.push((market, IMToken::accrueInterestCall { }.abi_encode()));
+                }
+                let data = IMToken::getAccountSnapshotCall { account: *account }.abi_encode();
+                snapshot_calls.push((market, data, *account, market));
+            }
+        }
+
+        let mut calls = Vec::new();
+        for (target, calldata) in &accrue_calls {
+
+            calls.push(IMulticall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: calldata.clone().into(),
+            });
+        }
+        for (target, calldata, _, _)in &snapshot_calls {
+            calls.push(IMulticall3::Call3 {
+                target: *target,
+                allowFailure: true,
+                callData: calldata.clone().into(),
+            });
+        }
+
+        let mcall = IMulticall3::new(MULTICALL3, &self.provider);
+        let results = mcall.aggregate3(calls).call().await?;
+        if results.len() != accrue_calls.len() + snapshot_calls.len() {
+            anyhow::bail!("aggregate3 hasil tidak lengkap: {} != {}", results.len(), accrue_calls.len() + snapshot_calls.len());
+        }
+
+        // Pakai index snapshot_calls (setelah blok accrue) untuk upsert state.
+
+        let mut updated = 0usize;
+        for (i, (_, _, account, market))in snapshot_calls.iter().enumerate() {
+
+            let idx = accrue_calls.len() + i;
+            if !results[idx].success {
+                warn!(?account, ?market, "accrue+snapshot sweep gagal — state dibiarkan");
+                continue;
+            }
+            let snap = IMToken::getAccountSnapshotCall::abi_decode_returns(&results[idx].returnData);
+            match snap {
+                Ok(snap) => {
+                    self.state.upsert_or_remove(
+                        *account,
+                        *market,
+                        Position {
+                            mtoken_balance: snap.mTokenBalance,
+                            borrow_balance: snap.borrowBalance,
+                            exchange_rate: snap.exchangeRateMantissa,
+                        },
+                    );
+                    updated += 1;
+                }
+                Err(e) => warn!(?e, ?account, "decode snapshot sweep gagal"),
+            }
+        }
+        info!(candidates = candidates.len(), updated, "sweep akun marginal selesai");
         Ok(())
     }
 
