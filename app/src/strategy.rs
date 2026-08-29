@@ -1,9 +1,10 @@
 use crate::config::Config;
-use crate::contracts::{IComptroller, IMToken, LiquidationJob, Mode, COMPTROLLER};
+use crate::contracts::{IComptroller, IMToken, IMulticall3, LiquidationJob, Mode, MULTICALL3, COMPTROLLER};
 use crate::health::{classify, health_factor, Health, MarketInfo};
 use crate::state::{Position, SharedState};
 use crate::swap::{apply_slippage, build_aerodrome_swap, is_stable_symbol};
 use alloy::primitives::{Address, U256};
+use alloy::sol_types::SolCall;
 use alloy::providers::Provider;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -158,10 +159,49 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         drop(positions);
 
         // Refresh posisi kandidat di kedua market — snapshot state bisa basi
-        // (bunga terakru, likuidasi lain). Bangun job dari data segar.
-        for market in [mloan, mcoll] {
-            let mtoken = IMToken::new(market, &self.provider);
-            match mtoken.getAccountSnapshot(borrower).call().await {
+        // (bunga terakru, likuidasi lain). Bangun job dari data segar. Kedua
+        // market di-accrue-dulu dalam SATU batch + snapshot borrower —
+        // `getAccountSnapshot` view TIDAK meng-accrue bunga, jadi state
+        // on-chain yang di-accrue lewat `Multicall3` memberi nilai eksak
+        // (bukan proyeksi off-chain) sambil hanya 1 round-trip RPC.
+        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+        for &market in &[mloan, mcoll] {
+            calls.push(IMulticall3::Call3 {
+                target: market,
+                allowFailure: true,
+                callData: IMToken::accrueInterestCall { }.abi_encode().into(),
+            });
+        }
+        for &market in &[mloan, mcoll] {
+            calls.push(IMulticall3::Call3 {
+                target: market,
+                allowFailure: true,
+                callData: IMToken::getAccountSnapshotCall { account: borrower }.abi_encode().into(),
+            });
+        }
+        let mcall = IMulticall3::new(MULTICALL3, &self.provider);
+        let res = mcall.aggregate3(calls).call().await?;
+        if res.len() != 4 {
+            warn!(
+                ?borrower, got = res.len(),
+                "refresk kandidat multicall tidak lengkap — skip"
+            );
+            return Ok(None);
+        }
+        for (i, market)in [mloan, mcoll].into_iter().enumerate() {
+            let acc = &res[i];
+            let r = &res[2 + i];
+            // `accrueInterest()` mengembalikan uint256 error code — call yang
+            // "sukses" tetap bisa membawa kode non-zero (state tak terakru penuh.
+            let accrue_ok = acc.success
+                && IMToken::accrueInterestCall::abi_decode_returns(&acc.returnData)
+                    .map(|r| r == U256::ZERO)
+                    .unwrap_or(false);
+            if !accrue_ok || !r.success {
+                warn!(?borrower, ?market, "accrue+snapshot kandidat gagal — skip");
+                return Ok(None);
+            }
+            match IMToken::getAccountSnapshotCall::abi_decode_returns(&r.returnData) {
                 Ok(s) => snap.state.upsert_or_remove(
                     borrower,
                     market,
@@ -172,7 +212,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                     },
                 ),
                 Err(e) => {
-                    warn!(?borrower, ?market, ?e, "refresh kandidat gagal — skip");
+                    warn!(?borrower, ?market, ?e, "decode snapshot kandidat gagal — skip");
                     return Ok(None);
                 }
             }
@@ -298,6 +338,9 @@ fn amount_in_buffer_bps(mode: Mode) -> u64 {
     match mode {
         Mode::Oev => 10_000,
         Mode::Classic => 9_500,
+        // `sol!` menambah varian sentinel `__Invalid` untuk nilai enum tak dikenal.
+
+        Mode::__Invalid => 9_500,
     }
 }
 
@@ -350,6 +393,13 @@ fn build_swap_parts(
         // melebihi saldo aktual pasca-split yang bergeser dari harga cache.
         let amount_in = liquidator_usd * one / coll.price
             * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
+        // expected_loan_out ikut di-buffer SELARAS dengan amount_in: hanya
+        // 95% sitaan estimasi yang benar-benar di-swap (sisa kolateral tak
+        // ter-swap tidak dihitung sebagai profit di mode swap), jadi menjanjikan
+        // minLoanOut berdasarkan nilai penuh membuat likuidasi yang masih profitabel
+        // (harga bergeser < buffer) ditolak guard. minProfit (config) tetap
+        // menjadi lantai ekonomi yang sebenarnya.
+
         let expected_loan_out = liquidator_usd * one / loan.price
             * U256::from(amount_in_buffer_bps) / U256::from(10_000u64);
 
@@ -525,6 +575,13 @@ impl<P> Strategy<P> {
             info.price = price;
         }
     }
+
+    /// Snapshot markets ter-lock saat ini (harga terbaru hasil refresh_prices),
+    /// dipakai pemanggil yang butuh MarketInfo segar tanpa memegang lock lama
+    /// (mis. sweep_marginal_borrowers) — clone di bawah lock singkat, tanpa I/O.
+    pub fn markets_snapshot(&self) -> HashMap<Address, MarketInfo> {
+        self.markets.clone()
+    }
 }
 
 #[cfg(test)]
@@ -588,12 +645,39 @@ min_profit_wei = "1000"
         }
     }
 
-    /// Fallback OEV->Classic harus menaikkan amount_in karena Classic
-    /// men-redeem SELURUH sitaan (profit 100%) bukan split OEV 30%.
-    /// Kalau tidak, calldata swap menukar terlalu sedikit & profit < minProfit
-    /// sehingga fallback klasik selalu gagal. (Fix PR #14 comment #1.)
+    /// Fallback OEV->Classic harus membangun ulang swap dengan entitas Classic
+    /// (men-redeem SELURUH sitaan: liquidator menerima 100% profit, bukan
+    /// split OEV 30%). Kalau tidak, calldata swap menukar terlalu sedikit
+    /// relatif terhadap sitaan & profit < minProfit sehingga fallback selalu gagal.
+    /// (Fix PR #14 comment #1.)
+    ///
+    /// Invariant yang benar BUKAN "Classic menukar lebih banyak dari OEV":
+    /// buffer amount_in Classic (95%) bisa lebih besar dari selisih split profit
+    /// (buffer 5% × nilai-sitaan vs 70% × profit-tipis), sehingga jumlah
+    /// kolateral yang ditukar Classic bisa saja lebih kecil dari OEV. Yang
+    /// dijamin rebuild: (1) swap disiapkan untuk entitas sitaan penuh
+    /// (dikurangi buffer pengaman agar tidak melebihi saldo aktual);
+    /// (2) `minLoanOut` longgar (tidak memblokir likuidasi yang masih
+    /// profitabel — guard sesungguhnya minProfit).
+    fn amount_in_from_swap(data: &alloy::primitives::Bytes) -> U256 {
+        // swapExactTokensForTokens(uint256 amountIn, ...): amountIn = arg pertama
+        // (word-32 setelah selector 4B).
+        let bytes = data.as_ref();
+        U256::from_be_slice(&bytes[4..36])
+    }
+
+    /// liquidator_usd (skala 1e18) yang dikodekan ke dalam swap untuk satu
+    /// mode — dibalik dari amount_in & buffer, membuktikan entitas yang dipakai.
+    fn liquidator_usd_of(data: &alloy::primitives::Bytes, coll_price: U256, mode: Mode) -> U256 {
+        let amount_in = amount_in_from_swap(data);
+        // amount_in = liquidator_usd * buffer(mode)/10000 / coll_price → balik.
+
+        let one = U256::from(10u64.pow(18));
+        amount_in * coll_price * U256::from(10_000u64) / (U256::from(amount_in_buffer_bps(mode)) * one)
+    }
+
     #[test]
-    fn rebuild_classic_amount_in_lebih_besar_dari_oev() {
+    fn rebuild_classic_pakai_entitas_sitaan_penuh() {
         let snap = snapshot();
         // repay ~ $10.000 di mUSDC, collateral mWETH.
         let repay = U256::from(10_000u64) * U256::from(10u64.pow(6)); // USDC 6 desimal
@@ -613,14 +697,32 @@ min_profit_wei = "1000"
             Mode::Classic,
             amount_in_buffer_bps(Mode::Classic),).unwrap();
 
-        // amount_in dalam wei WETH (18 des). Classic > OEV karena split penuh.
         assert!(
             classic.0 != Address::ZERO && oev.0 != Address::ZERO,
             "swap aktif untuk kedua mode"
         );
-        // dekode amountIn dari calldata swap terlebih dahulu — lebih sederhana:
-        // bandingkan `expected_loan_out` via minLoanOut (lebih besar utk Classic).
-        assert!(classic.2 > oev.2, "Classic harus menjanjikan lebih banyak loan out");
+
+        // Rebuild harus menyiapkan swap untuk entitas sitaan penuh (Classic:
+        // repay + 100% profit), bukan entitas OEV (30% split). Terlihat dari
+        // liquidator_usd ter-rekonstruksi (Classic ≈ $10.667k > OEV ≈ $10.201k).
+        let coll_price = snap.markets[&addr(2)].price;
+        let oev_usd = liquidator_usd_of(&oev.1, coll_price, Mode::Oev);
+        let classic_usd = liquidator_usd_of(&classic.1, coll_price, Mode::Classic);
+        assert!(
+            classic_usd > oev_usd,
+            "Classic harus mengkodekan entitas sitaan penuh ({} > {}",
+            classic_usd, oev_usd
+        );
+
+        // minLoanOut Classic diharapkan longgar (tidak lebih ketat dari OEV);
+        // guard ekonomi yang sebenarnya ada di minProfit (config). Jika guard
+        // minLoanOut malah lebih ketat dari OEV, likuidasi profitabel bisa
+        // diblokir (fix review PR #16).
+        assert!(
+            classic.2 <= oev.2,
+            "minLoanOut Classic harus longgar (tidak > OEV): {} vs {}",
+            classic.2, oev.2
+        );
     }
 
     /// Bila swap nonaktif, rebuild menonaktifkan swapTarget dan memakai ambang

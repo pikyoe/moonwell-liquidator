@@ -50,3 +50,16 @@
 - 🟡 Buffer amount_in Classic 95% (`amount_in_buffer_bps`: OEV 10000, Classic 9500) — jalur B tidak meng-update harga; sitaan aktual bisa < estimasi dari harga cache → buffer mencegah swap revert.
 
 - Catatan: perubahan ini TIDAK dieksekusi test di sesi ini(lingkup static); jalankan `forge test` + `cargo test` + `clippy` sebelum merge (seperti biasa).
+
+
+## Verifikasi live 2026-08-28 (Rec 1/3/4 — accrue-fresh via Multicall3)
+- **Selector benar** wajib dipakai: `accrueInterest()` = `0xa6afed95` (BUKAN `0xa6f2f160` yang ternyata selector fungsi lain); `getAccountSnapshot(address)` = `0xc37f68e2`; `aggregate3((address,bool,bytes)[])` = `0x82ad56cb`. Cek selector baru via keccak (pycryptodome) kalau ragu.
+
+- **encoding `Call3[]` otoritas**: panggil `aggregate3` dengan ABI eksternal—head: selector, `0x20` (offset), `len`, lalu per struct: `(target, allowFailure, 0x60, lenCallData, callData-padded-kanan)`. Padding **kanan** (`ljust`) untuk data bytes; **kiri** untuk nilai.
+- **Penting**: alloy `IMulticall3::Call3` + `.abi_encode()` + `aggregate3(calls)` SUDAH menghasilkan encoding canonical yang benar — jangan ganti pakai by-hand encoding`.
+
+- **RPC publik `https://mainnet.base.org`** menerima accrue (non-view) via eth_call — sukses return 0 (kasus tak ada bunga terakru. Snapshot `getAccountSnapshot` untuk alamat tanpa posisi di market **revert** — `allowFailure: true` menangkapnya; evaluasi-bot skip dengan benar (borrower tanpa posisi di kedua market = tak likuidatable)
+- **Multicall3 Base**: `0xca11bde05977b3631167028862be2a173976ca11`, runtime 3808B tanpa STATICCALL (`fa`) — accrue berfungsi dalam simulasi eth_call. `urllib` kena 403 di RPC publik — pakai `curl` atau set `User-Agent`.
+
+- Implementasi terverifikasi (15/15 cargo test, 0 clippy baru): `evaluate()` & sweep indexer memakai ONE `aggregate3` batch per borrower:2 accrue +2 snapshot, ALLOW_FAILURE true, decode `getAccountSnapshotCall::abi_decode_returns`. Snapshot untuk borrower tanpa posisi di salah satu market = OK lenient (accrue sukses, snapshot revert->skip, benar untuk kandidat tak likuidatable).
+- **Buffer Classic 95%** (`amount_in_buffer_bps`) tetap perlu — di live, valuasi sitaan dari harga cache bisa > aktual; buffer cegah swap revert.(Catatan lama AGENTS.md juga menyebut ini.)
