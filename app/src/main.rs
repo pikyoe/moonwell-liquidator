@@ -247,6 +247,12 @@ async fn main() -> Result<()> {
         // punya permit sendiri sehingga TIDAK menunggu scan blok reguler
         // (dan tidak memperebutkan permit yang sama).
         let oev_scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        // Gate refresh harga per-blok: try-acquire mencegah task refresh menumpuk
+        // kalau satu refresh (yang melakukan N+3 RPC serial) belum selesai saat
+        // blok berikutnya tiba — refresh berikutnya di-skip; harga basi sesaat lebih
+        // baik daripada men-stall loop blok menunggu I/O serial.
+
+        let refresh_gate = Arc::new(tokio::sync::Semaphore::new(1));
         // Gate terpisah untuk sweep marginal-borrower: try-acquire mencegah
         // task sweep menumpuk (pile-up) bila satu sweep sebelumnya belum
         // selesai saat interval berikutnya tiba (RPC accrue-fresh lambat).
@@ -308,10 +314,26 @@ async fn main() -> Result<()> {
                 });
             }
 
-            if number % 10 == 0 {
-                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
-                    warn!(?e, "refresh harga gagal");
-                }
+            // Refresh harga per-blok di task background (bukan inline): refresh_prices
+            // melakukan N+3 RPC serial, sehingga menunggunya di loop blok bisa
+            // membuat bot jatuh tertinggal di chain cepat (Base ~2 dtk/blok). Try-
+            // acquire mencegah task menumpuk; pada blok OEV-trigger refresh sudah
+            // dijalankan inline di atas (harga segar untuk job OEV), jadi di-skip..
+
+            if !oev_trigger {
+                let strategy = strategy.clone();
+                let http = http.clone();
+                let cfg = cfg.clone();
+                let refresh_gate = refresh_gate.clone();
+                tasks.spawn(async move {
+                    let permit = match refresh_gate.try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if let Err(e) = refresh_prices(&http, &cfg, strategy).await {
+                        warn!(?e, "refresh harga gagal");
+                    }
+                });
             }
 
             // Scan blok ini TANPA memegang mutex strategy: snapshot diambil di
