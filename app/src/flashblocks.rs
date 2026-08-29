@@ -171,8 +171,18 @@ fn filter_tx(t: &Transaction, addresses: &[Address]) -> bool {
     t.to.is_some_and(|to| addresses.contains(&to))
 }
 
+/// Jenis subscription yang sedang ditangani — dipakai sebagai diskriminator
+/// tegas di `handle_message` (bukan coba-parse Log lalu Transaction berurutan
+/// yang bisa salah-klasifikasi payload tidak dikenal)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionKind {
+    FlashblocksLogs,
+    MempoolTxs,
+}
+
 async fn handle_message(
     text: &str,
+    kind: SubscriptionKind,
     addresses: &[Address],
     tx: &tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
@@ -181,33 +191,42 @@ async fn handle_message(
         return Ok(());
     }
     let result = &v["params"]["result"];
-    if let Ok(log) = serde_json::from_value::<Log>(result.clone()) {
-        let t0 = log.topics().first().copied();
-        if let Some(t0) = t0 {
-            if watch_topics().contains(&t0) {
-                let _ = tx.send(FastSignal::Log {
-                    address: log.address(),
-                    topic0: t0,
-                    tx_hash: log.tx_hash.unwrap_or_default(),
-                });
+    match kind {
+        SubscriptionKind::FlashblocksLogs => {
+            match serde_json::from_value::<Log>(result.clone()) {
+                Ok(log) => {
+                    let t0 = log.topics().first().copied();
+                    if let Some(t0) = t0 {
+                        if watch_topics().contains(&t0) {
+                            let _ = tx.send(FastSignal::Log {
+                                address: log.address(),
+                                topic0: t0,
+                                tx_hash: log.tx_hash.unwrap_or_default(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => warn!(?e, "pesan flashblocks bukan Log — diabaikan"),
             }
         }
-        return Ok(());
-    }
-    if let Ok(t) = serde_json::from_value::<Transaction>(result.clone()) {
-        if filter_tx(&t, addresses) {
-            let input = t.input.to_vec();
-            let intent = decode_intent(t.from, &input);
-            let _ = tx.send(FastSignal::Tx {
-                from: t.from,
-                to: t.to,
-                input,
-                intent,
-            });
+        SubscriptionKind::MempoolTxs => {
+            match serde_json::from_value::<Transaction>(result.clone()) {
+                Ok(t) => {
+                    if filter_tx(&t, addresses) {
+                        let input = t.input.to_vec();
+                        let intent = decode_intent(t.from, &input);
+                        let _ = tx.send(FastSignal::Tx {
+                            from: t.from,
+                            to: t.to,
+                            input,
+                            intent,
+                        });
+                    }
+                }
+                Err(e) => warn!(?e, "pesan mempool bukan Transaction — diabaikan"),
+            }
         }
-        return Ok(());
     }
-    warn!("pesan subscription tidak dikenal — diabaikan");
     Ok(())
 }
 
@@ -268,7 +287,7 @@ pub async fn run_flashblocks_monitor(
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::FlashblocksLogs, &addresses, &tx).await {
                                 warn!(?e, "flashblocks message handling failed");
                             }
                         }
@@ -316,7 +335,7 @@ pub async fn run_mempool_monitor(
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::MempoolTxs, &addresses, &tx).await {
                                 warn!(?e, "mempool message handling failed");
                             }
                         }
