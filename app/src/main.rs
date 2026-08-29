@@ -342,14 +342,20 @@ async fn main() -> Result<()> {
             // Non-blocking: di-spawn agar loop blok tidak menunggu RPC sweep.
 
             if cfg.sweep_interval_blocks > 0 && number % cfg.sweep_interval_blocks == 0 {
-                if let Err(e) = refresh_prices(&http, &cfg, strategy.clone()).await {
-                    warn!(?e, "refresh harga saat sweep gagal");
-                }
                 let indexer_sweep = indexer.clone();
-                let markets_sweep = markets.clone();
+                let strategy_sweep = strategy.clone();
+                let http_sweep = http.clone();
+                let cfg_sweep = cfg.clone();
                 let threshold = cfg.sweep_hf_threshold_scaled;
                 tasks.spawn(async move {
-                    if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_sweep, threshold).await {
+                    // Refresh harga + ambil snapshot markets DI DALAM task agar loop
+                    // blok tidak menunggu I/O RPC sweep (dan sweep memakai harga
+                    // terkini dari strategy, bukan map startup yang beku).
+                    if let Err(e) = refresh_prices(&http_sweep, &cfg_sweep, strategy_sweep.clone()).await {
+                        warn!(?e, "refresh harga saat sweep gagal");
+                    }
+                    let markets_fresh = strategy_sweep.lock().await.markets_snapshot();
+                    if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_fresh, threshold).await {
                         warn!(?e, "sweep akun marginal gagal");
                     }
                 });

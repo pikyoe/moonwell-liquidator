@@ -207,12 +207,22 @@ impl<P: Provider + Clone + Send + Sync + 'static> Indexer<P> {
 
         // Pakai index snapshot_calls (setelah blok accrue) untuk upsert state.
 
+        // `accrueInterest()` mengembalikan uint256 error code (0 = sukses) —
+        // call yang "sukses" (allowFailure diterima) tetap bisa membawa kode
+        // non-zero. Prekomputasi per market supaya cek sekali (bukan per akun).
+        let mut accrue_result_ok: HashMap<Address, bool> = HashMap::new();
+        for (i, (market, _))in accrue_calls.iter().enumerate() {
+            let accrue_ok = results[i].success
+                && IMToken::accrueInterestCall::abi_decode_returns(&results[i].returnData)
+                    .map(|r| r == U256::ZERO)
+                    .unwrap_or(false);
+            accrue_result_ok.insert(*market, accrue_ok);
+        }
+
         let mut updated = 0usize;
         for (i, (_, _, account, market))in snapshot_calls.iter().enumerate() {
-
             let idx = accrue_calls.len() + i;
-            let accrue_idx = accrue_calls.iter().position(|(m, _)| m == market).unwrap();
-            if !results[accrue_idx].success || !results[idx].success {
+            if !accrue_result_ok.get(market).copied().unwrap_or(false) || !results[idx].success {
                 warn!(?account, ?market, "accrue+snapshot sweep gagal — state dibiarkan");
                 continue;
             }
