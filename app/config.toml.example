@@ -27,13 +27,43 @@ hypersync_token = "ISI_TOKEN_ENVIO"
 # Bot memantau event `PriceUpdatedEarlyAndLiquidated` (bukan UpdatedPrices - itu
 # tidak dipancarkan). Daftar ini ditambah hasil resolve dinamis via
 # `oracle.getFeed(symbol)` saat startup. Wrapper WETH Base (terverifikasi):
-oev_wrappers = ["0x57DA741aD933869cC9EBfb9668288053A0738f3c"]
+oev_wrappers = [
+    "0x57DA741aD933869cC9EBfb9668288053A0738f3c",   # WETH
+    "0xb7967d184907737a955f39a8067bc1a0cc313292",    # USDC
+    "0xfea70a74d94a6b6f9764db9c4867bbe4678a5da6",    # cbBTC
+    "0xf655eedede0cd9f7a3de5e8018909c429dcfbf9b",    # USDS
+    "0x0eab3b9ae08b43077ad1aeb9820462faf99bcec8",    # DAI
+    "0x3623c921bfd9d7e9d88e5cbb436b68be2c2bc0b7",    # AERO
+]
 
 # Endpoint Flashblocks Base MAINNET untuk submit preconf cepat (+200ms) - AKTIF.
 # Semua public endpoint Base sudah Flashblocks-enabled(docs.base.org). Bila ingin
 # jalur submit privat(anti front-run di mempool publik), ganti dengan endpoint
 # provider privat(Alchemy/QuickNode/Chainstack) yang mendukung Flashblocks.
 flashblocks_endpoint = "https://mainnet.flashblocks.base.org"
+
+# Optional: WSS endpoint Flashblocks (Chainstack) untuk memantau log
+# preconfirmation(~200 ms sebelum blok final) sebagai pemicu scan cepat.
+
+
+# Isi dari dashboard Chainstack Anda(yang Flashblocks-enabled; wajib WSS.)
+# Kalau dikosongkan, monitor Flashblocks TIDAK aktif - bot tetap jalan normal.
+
+
+# flashblocks_ws = "wss://flashblocks.base.chainstack.com/your-token"
+
+# Monitor mempool (newPendingTransactions) sebagai early-warning tx yang
+# menyentuh kontrak kita sebelum masuk blok. Kosongkan = pakai
+# flashblocks_ws, lalu base_rpc_ws.
+mempool_enabled = true
+mempool_ws   = ""
+# Debounce scan cepat (ms) — mencegah ledakan event dalam satu flashblock
+# memicu puluhan refresh RPC beruntun. Kecilkan bila RPC premium kuat,;
+
+
+# perbesar bila sering kena rate-limit..
+
+fast_signal_debounce_ms = 300
 
 # ---- WAJIB DIISI ----
 private_key    = "0x..."

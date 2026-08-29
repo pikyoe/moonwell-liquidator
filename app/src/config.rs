@@ -10,6 +10,25 @@ pub struct Config {
     /// menghindari race dengan mempool publik. Contoh mainnet:
     /// "https://mainnet.flashblocks.base.org" (atau endpoint provider privat).
     pub flashblocks_endpoint: Option<String>,
+    /// Optional: endpoint WSS Chainstack Flashblocks untuk memantau log
+    /// preconfirmation (~200 ms). Wajib WSS. Contoh:
+    /// "wss://flashblocks.base.chainstack.com/..."  — isi dari dashboard Anda.
+    #[serde(default)]
+    pub flashblocks_ws: Option<String>,
+    /// Aktifkan monitor mempool ((newPendingTransactions antara) sebagai
+    /// early-warning tx yang menyentuh kontrak kita sebelum masuk blok.
+
+    #[serde(default = "default_true")]
+    pub mempool_enabled: bool,
+    /// WSS endpoint untuk mempool. Kosongkan = pakai `flashblocks_ws`,
+    /// kalau itu juga kosong pakai `base_rpc_ws`.
+    #[serde(default)]
+    pub mempool_ws: Option<String>,
+    /// Jeda minimum antar scan cepat yang dipicu sinyal preconfirmation/mempool
+    /// (ms). Debounce agar ledakan event dalam satu flashblock tidak
+    /// memicu puluhan refresh RPC beruntun. Default 300.
+    #[serde(default = "default_fast_signal_debounce_ms")]
+    pub fast_signal_debounce_ms: u64,
     /// Endpoint Envio HyperSync untuk pengganti eth_getLogs (baca event log).
     /// Default: "https://base.hypersync.xyz". HyperSync TIDAK memakai RPC
     /// eth_getLogs sehingga tidak terkena pembatasan free-tier RPC.
@@ -220,6 +239,9 @@ fn default_hypersync_token() -> String {
 }
 fn default_max_position() -> u64 {
     25_000
+}
+fn default_fast_signal_debounce_ms() -> u64 {
+    300
 }
 fn default_max_gas_cost() -> String {
     "500000000000000".into() // 0.0005 ETH
