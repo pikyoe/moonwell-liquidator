@@ -233,7 +233,7 @@ async fn main() -> Result<()> {
     watch_addrs.sort_unstable();
     watch_addrs.dedup();
 
-    let (fast_tx, fast_rx) = tokio::sync::mpsc::unbounded_channel::<FastSignal>();
+    let (fast_tx, mut fast_rx) = tokio::sync::mpsc::unbounded_channel::<FastSignal>();
     let selectors = crate::flashblocks::watch_selectors();
 
     if let Some(fb_ws) = cfg.flashblocks_ws.clone().filter(|u| !u.trim().is_empty()) {

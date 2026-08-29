@@ -63,3 +63,13 @@
 
 - Implementasi terverifikasi (15/15 cargo test, 0 clippy baru): `evaluate()` & sweep indexer memakai ONE `aggregate3` batch per borrower:2 accrue +2 snapshot, ALLOW_FAILURE true, decode `getAccountSnapshotCall::abi_decode_returns`. Snapshot untuk borrower tanpa posisi di salah satu market = OK lenient (accrue sukses, snapshot revert->skip, benar untuk kandidat tak likuidatable).
 - **Buffer Classic 95%** (`amount_in_buffer_bps`) tetap perlu — di live, valuasi sitaan dari harga cache bisa > aktual; buffer cegah swap revert.(Catatan lama AGENTS.md juga menyebut ini.)
+
+## Migrasi Alloy 1.8.x (2026-08-29 — audit flashblocks.rs & main.rs)
+- Breaking API Alloy 1.8: `Transaction`/`Log` rpc structs memakai trait accessors (`alloy_consensus::Transaction` trait — alias `ConsensusTransaction` di flashblocks karena clash nama dengan tipe `alloy::rpc::types::Transaction`; `TransactionResponse` membuka `.tx_hash()`, `.from()` dll di layer provider). Field lang langsung (`.to`, `.from`, `.input`, `.tx_hash`) TIDAK ada lagi.
+
+- `abi_decode` alloy 1.8 TIDAK lagi menerima argumen `validate`: cukup `abi_decode(input)`. (di alloy-sol-types 1.7.1 baris function.rs:92, signature 1 arg).
+- `Log.tx_hash` → `Log.transaction_hash` (Option<B256>).
+- `SolEvent::{SIGNATURE_HASH, SIGNATURE}` butuh `use alloy::sol_types::SolEvent;` (trait in scope).
+- `WebSocketStream::send` butuh `use futures::SinkExt;`.
+- Toolchain Debian (`rustc 1.85`) KURANG: alloy 1.8.3 requires rustc 1.91+; pakai rustup stable (1.98, diverifikasi. `cargo check/build/test` semua hijau (15/15 test, clippy 0 error;3 warning dead-code `FastSignal::{to,input,topic0,kind}` pre-existing di PR #20 — bukan baru. Jangan hapus warning itu di sesi ini.)
+- Kata kunci `tokio-tungstenite` + `rustls-native-certs` kini tercantum di Cargo.lock (ditambahkan saat `cargo build` regenerasi lock untuk PR flashblocks).

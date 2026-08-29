@@ -1,8 +1,10 @@
+use alloy::consensus::Transaction as ConsensusTransaction;
+use alloy::network::TransactionResponse;
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::{Log, Transaction};
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolEvent};
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -140,7 +142,7 @@ fn decode_intent(from: Address, input: &[u8]) -> Option<TxIntent> {
     }
     match &input[..4] {
         s if *s == liquidateBorrowCall::SELECTOR => {
-            let call = liquidateBorrowCall::abi_decode(input, true).ok()?;
+            let call = liquidateBorrowCall::abi_decode(input).ok()?;
             Some(TxIntent::Liquidation {
                 borrower: call.borrower,
                 liquidator: from,
@@ -149,7 +151,7 @@ fn decode_intent(from: Address, input: &[u8]) -> Option<TxIntent> {
             })
         }
         s if *s == updatePriceEarlyAndLiquidateCall::SELECTOR => {
-            let call = updatePriceEarlyAndLiquidateCall::abi_decode(input, true).ok()?;
+            let call = updatePriceEarlyAndLiquidateCall::abi_decode(input).ok()?;
             Some(TxIntent::OevLiquidation {
                 borrower: call.borrower,
                 liquidator: from,
@@ -168,7 +170,7 @@ fn decode_intent(from: Address, input: &[u8]) -> Option<TxIntent> {
 /// selector saja tidak aman: selector transfer/likuidasi muncul di seluruh
 /// Base mempool, dan tx tak terkait tidak boleh memicu refresh+scan.
 fn filter_tx(t: &Transaction, addresses: &[Address]) -> bool {
-    t.to.is_some_and(|to| addresses.contains(&to))
+    t.to().is_some_and(|to| addresses.contains(&to))
 }
 
 /// Jenis subscription yang sedang ditangani — dipakai sebagai diskriminator
@@ -201,7 +203,7 @@ async fn handle_message(
                             let _ = tx.send(FastSignal::Log {
                                 address: log.address(),
                                 topic0: t0,
-                                tx_hash: log.tx_hash.unwrap_or_default(),
+                                tx_hash: log.transaction_hash.unwrap_or_default(),
                             });
                         }
                     }
@@ -213,11 +215,11 @@ async fn handle_message(
             match serde_json::from_value::<Transaction>(result.clone()) {
                 Ok(t) => {
                     if filter_tx(&t, addresses) {
-                        let input = t.input.to_vec();
-                        let intent = decode_intent(t.from, &input);
+                        let input = t.input().to_vec();
+                        let intent = decode_intent(t.from(), &input);
                         let _ = tx.send(FastSignal::Tx {
-                            from: t.from,
-                            to: t.to,
+                            from: t.from(),
+                            to: t.to(),
                             input,
                             intent,
                         });
