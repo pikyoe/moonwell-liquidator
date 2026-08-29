@@ -362,6 +362,7 @@ async fn main() -> Result<()> {
                     };
                     // Refresh harga DI DALAM task agar loop blok tidak menunggu
                     // I/O RPC sweep.
+
                     if let Err(e) = refresh_prices(&http_sweep, &cfg_sweep, strategy_sweep.clone()).await {
                         warn!(?e, "refresh harga saat sweep gagal");
                     }
