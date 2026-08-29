@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
                 let cfg = cfg.clone();
                 let refresh_gate = refresh_gate.clone();
                 tasks.spawn(async move {
-                    let permit = match refresh_gate.try_acquire_owned() {
+                    let _permit = match refresh_gate.try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => return,
                     };
