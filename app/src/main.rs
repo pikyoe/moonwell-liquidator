@@ -261,8 +261,8 @@ async fn main() -> Result<()> {
             // koneksi maupun gap antar-koneksi (last_processed di luar loop).
             // PENTING: `watch_block` dipanggil untuk rentang (bukan per blok)
             // dengan daftar wrapper OEV agar event trigger di rentang gap pun
-            // dihitung (sebelumnya `process_block_logs` memakai &[] sehingga
-            // trigger OEV di replay hilang).
+            // dihitung (sebelumnya replay memakai `&[]` sehingga trigger OEV
+            // di rentang gap hilang).
             if let Some(prev) = last_processed {
                 if number > prev + 1 {
                     let from = prev + 1;
