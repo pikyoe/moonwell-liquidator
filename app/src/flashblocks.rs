@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::{Log, Transaction};
-use alloy::sol_types::SolCall
+use alloy::sol_types::SolCall;
 use anyhow::Result;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -132,7 +132,9 @@ pub fn watch_selectors() -> Vec<[u8; 4]> {
         transferCall::SELECTOR,
         updatePriceEarlyAndLiquidateCall::SELECTOR,
     ]
-}fn decode_intent(from: Address, input: &[u8]) -> Option<TxIntent> {
+}
+
+fn decode_intent(from: Address, input: &[u8]) -> Option<TxIntent> {
     if input.len() < 4 {
         return None;
     }
@@ -156,23 +158,22 @@ pub fn watch_selectors() -> Vec<[u8; 4]> {
                 m_token_loan: call.mTokenLoan,
             })
         }
-        _ if watch_selectors().contains(|s| s == &input[..4]) => Some(TxIntent::Activity),
+        _ if watch_selectors().iter().any(|s| *s == input[..4]) => Some(TxIntent::Activity),
         _ => None,
     }
 }
 
-fn filter_tx(t: &Transaction, addresses: &[Address], selectors: &[[u8; 4]]) -> bool {
-    let input = t.input.to_vec();
-    let to_hit = t.to.is_some_and(|to| addresses.contains(&to));
-    let sel_hit = input.len() >= 4
-        && selectors.iter().any(|s| input[..4] == *s);
-    to_hit || sel_hit
+/// Hanya tx yang benar-benar menyentuh alamat yang dipantau (market,
+/// comptroller, wrapper OEV, executor, signer) yang diteruskan — pencocok
+/// selector saja tidak aman: selector transfer/likuidasi muncul di seluruh
+/// Base mempool, dan tx tak terkait tidak boleh memicu refresh+scan.
+fn filter_tx(t: &Transaction, addresses: &[Address]) -> bool {
+    t.to.is_some_and(|to| addresses.contains(&to))
 }
 
 async fn handle_message(
     text: &str,
     addresses: &[Address],
-    selectors: &[[u8; 4]],
     tx: &tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let v: Value = serde_json::from_str(text)?;
@@ -194,7 +195,7 @@ async fn handle_message(
         return Ok(());
     }
     if let Ok(t) = serde_json::from_value::<Transaction>(result.clone()) {
-        if filter_tx(&t, addresses, selectors) {
+        if filter_tx(&t, addresses) {
             let input = t.input.to_vec();
             let intent = decode_intent(t.from, &input);
             let _ = tx.send(FastSignal::Tx {
@@ -206,67 +207,68 @@ async fn handle_message(
         }
         return Ok(());
     }
+    warn!("pesan subscription tidak dikenal — diabaikan");
     Ok(())
 }
 
-async fn connect_and_subscribe(
-    url: &str,
-    subscribe: &mut impl FnMut(&mut WsStream) -> impl std::future::Future<Output = Result<Value>>,
-) -> Result<(WsStream, Value)> {
+/// Sambung WS, kirim `eth_subscribe`, dan validasi respons JSON-RPC.
+    /// Respons dengan `error` atau tanpa `result` yang valid ditolak —
+    /// monitor akan reconnect dengan backoff alih-alih menunggu diam.
+async fn connect_and_subscribe(url: &str, req: Value) -> Result<(WsStream, Value)> {
     let (mut ws, _resp) = connect_async(url).await?;
-    let id = subscribe(&mut ws).await?;
-    Ok((ws, id))
+    ws.send(Message::Text(req.to_string().into())).await?;
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(t))) => {
+                let v: Value = serde_json::from_str(&t)?;
+                if v.get("id") != Some(&id) {
+                    continue;
+                }
+                if let Some(err) = v.get("error") {
+                    return Err(anyhow::anyhow!("subscription error: {err}"));
+                }
+                match v.get("result") {
+                    Some(r) if !r.is_null() => return Ok((ws, r.clone())),
+                    _ => return Err(anyhow::anyhow!("subscription response lacks valid result")),
+                }
+            }
+            Some(Ok(_)) => {}
+                        Some(Err(e)) => return Err(anyhow::anyhow!("{e}")),
+            None => return Err(anyhow::anyhow!("connection closed during subscribe")),
+        }
+    }
 }
+
 pub async fn run_flashblocks_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    selectors: Vec<[u8; 4]>,
+    _selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let topics: Vec<B256> = watch_topics();
     let addr_hex: Vec<String> = addresses.iter().map(|a| format!("{a:#x}")).collect();
     let topics_hex: Vec<String> = topics.iter().map(|t| format!("{t:#x}")).collect();
 
-    let mut subscribe = move |ws: &mut WsStream| {
-        let addr_hex = addr_hex.clone();
-        let topics_hex = topics_hex.clone();
-        async move {
-            let req = json!({
-                "id": 1u64,
-                "jsonrpc": "2.0",
-                "method": "eth_subscribe",
-                "params": ["pendingLogs", {
-                    "address": addr_hex,
-                    "topics": [topics_hex],
-                }],
-            });
-            ws.send(Message::Text(req.to_string().into()).await?;
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(t))) => {
-                        let v: Value = serde_json::from_str(&t)?;
-                        if v["id"] == json!(1u64) {
-                            return Ok(v["result"].clone());
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(anyhow::anyhow!("{e}"))),
-                    None => return Err(anyhow::anyhow!("connection closed during subscribe")),
-                }
-            }
-        }
-    };
-
     let mut backoff = Duration::from_millis(500);
     loop {
-        match connect_and_subscribe(&ws_url, &mut subscribe).await {
+        let req = json!({
+            "id": 1u64,
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["pendingLogs", {
+                "address": addr_hex.clone(),
+                "topics": [topics_hex.clone()],
+            }],
+        });
+        match connect_and_subscribe(&ws_url, req).await {
             Ok((mut ws, sub_id)) => {
                 info!(?sub_id, "flashblocks pendingLogs connected");
                 backoff = Duration::from_millis(500);
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, &addresses, &selectors, &tx).await {
+                            if let Err(e) = handle_message(&t, &addresses, &tx).await {
                                 warn!(?e, "flashblocks message handling failed");
                             }
                         }
@@ -296,42 +298,25 @@ pub async fn run_flashblocks_monitor(
 pub async fn run_mempool_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    selectors: Vec<[u8; 4]>,
+    _selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
-    let mut subscribe = move |ws: &mut WsStream| async move {
+    let mut backoff = Duration::from_millis(500);
+    loop {
         let req = json!({
             "id": 1u64,
             "jsonrpc": "2.0",
             "method": "eth_subscribe",
             "params": ["newPendingTransactions", true],
         });
-        ws.send(Message::Text(req.to_string().into()).await?;
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    let v: Value = serde_json::from_str(&t)?;
-                    if v["id"] == json!(1u64) {
-                        return Ok(v["result"].clone());
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(anyhow::anyhow!("{e}"))),
-                None => return Err(anyhow::anyhow!("connection closed during subscribe")),
-            }
-        }
-    };
-
-    let mut backoff = Duration::from_millis(500);
-    loop {
-        match connect_and_subscribe(&ws_url, &mut subscribe).await {
+        match connect_and_subscribe(&ws_url, req).await {
             Ok((mut ws, sub_id)) => {
                 info!(?sub_id, "mempool full-tx connected");
                 backoff = Duration::from_millis(500);
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, &addresses, &selectors, &tx).await {
+                            if let Err(e) = handle_message(&t, &addresses, &tx).await {
                                 warn!(?e, "mempool message handling failed");
                             }
                         }
