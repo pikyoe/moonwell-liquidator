@@ -38,6 +38,12 @@ pub enum FastSignal {
         address: Address,
         topic0: B256,
         tx_hash: B256,
+        /// Borrower yang diekstrak dari event Borrow/LiquidateBorrow/
+        /// PriceUpdatedEarlyAndLiquidated (None untuk Mint/Redeem/Transfer).
+        /// Dipakai main.rs agar sinyal preconfirmation akun BARU (belum ada
+        /// di state) tetap bisa di-refresh + di-scan secepatnya.
+
+        borrower: Option<Address>,
     },
     Tx {
         from: Address,
@@ -62,6 +68,7 @@ impl FastSignal {
     }
     pub fn borrower(&self) -> Option<Address> {
         match self {
+            FastSignal::Log { borrower: Some(b), .. } => Some(*b),
             FastSignal::Tx {
                 intent: Some(TxIntent::Liquidation { borrower, .. }),
                 ..
@@ -72,21 +79,6 @@ impl FastSignal {
             } => Some(*borrower),
             _ => None,
         }
-    }
-    pub fn is_competitor_liquidation(&self) -> bool {
-        matches!(
-            self,
-            FastSignal::Tx {
-                intent: Some(TxIntent::Liquidation { .. }),
-                ..
-            }
-        ) || matches!(
-            self,
-            FastSignal::Tx {
-                intent: Some(TxIntent::OevLiquidation { .. }),
-                ..
-            }
-        )
     }
 }
 
@@ -186,6 +178,7 @@ async fn handle_message(
     text: &str,
     kind: SubscriptionKind,
     addresses: &[Address],
+    selectors: &[[u8; 4]],
     tx: &tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let v: Value = serde_json::from_str(text)?;
@@ -197,6 +190,21 @@ async fn handle_message(
         SubscriptionKind::FlashblocksLogs => {
             match serde_json::from_value::<Log>(result.clone()) {
                 Ok(log) => {
+                    // Ekstrak borrower untuk event yang menyangkut posisi pinjam;
+                    // sinyal preconfirmation akun baru (belum ada di state) tetap bisa
+                    // di-refresh + di-scan cepat oleh penerima (lihat main.rs).
+
+                    let borrower = {
+                        if let Ok(ev) = Borrow::decode_log(&log.inner) {
+                            Some(ev.borrower)
+                        } else if let Ok(ev) = LiquidateBorrow::decode_log(&log.inner) {
+                            Some(ev.borrower)
+                        } else if let Ok(ev) = PriceUpdatedEarlyAndLiquidated::decode_log(&log.inner) {
+                            Some(ev.borrower)
+                        } else {
+                            None
+                        }
+                    };
                     let t0 = log.topics().first().copied();
                     if let Some(t0) = t0 {
                         if watch_topics().contains(&t0) {
@@ -204,6 +212,7 @@ async fn handle_message(
                                 address: log.address(),
                                 topic0: t0,
                                 tx_hash: log.transaction_hash.unwrap_or_default(),
+                                borrower,
                             });
                         }
                     }
@@ -212,10 +221,23 @@ async fn handle_message(
             }
         }
         SubscriptionKind::MempoolTxs => {
+            // Provider tertentu (mis. Base public RPC) mengabaikan argumen
+            // `true` dan tetap mengirim hash alih-alih objek penuh — terima
+            // tenang dan lewati (tanpa body, intent tidak bisa di-decode).
+            if result.is_string() {
+                return Ok(());
+            }
             match serde_json::from_value::<Transaction>(result.clone()) {
                 Ok(t) => {
                     if filter_tx(&t, addresses) {
                         let input = t.input().to_vec();
+                        // Hanya tx yang memanggil fungsi yang diawasi (borrow/redeem/
+                        // repay/transfer/liquidateBorrow/updatePriceEarlyAndLiquidate)
+                        // yang diteruskan; panggilan acak lain ke kontrak kita
+                        // (approve/mint/dll) tidak boleh memicu refresh+scan.
+                        if input.len() < 4 || !selectors.iter().any(|s| *s == input[..4]) {
+                            return Ok(());
+                        }
                         let intent = decode_intent(t.from(), &input);
                         let _ = tx.send(FastSignal::Tx {
                             from: t.from(),
@@ -264,7 +286,7 @@ async fn connect_and_subscribe(url: &str, req: Value) -> Result<(WsStream, Value
 pub async fn run_flashblocks_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    _selectors: Vec<[u8; 4]>,
+    selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let topics: Vec<B256> = watch_topics();
@@ -289,7 +311,7 @@ pub async fn run_flashblocks_monitor(
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, SubscriptionKind::FlashblocksLogs, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::FlashblocksLogs, &addresses, &selectors, &tx).await {
                                 warn!(?e, "flashblocks message handling failed");
                             }
                         }
@@ -319,25 +341,47 @@ pub async fn run_flashblocks_monitor(
 pub async fn run_mempool_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    _selectors: Vec<[u8; 4]>,
+    selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let mut backoff = Duration::from_millis(500);
     loop {
-        let req = json!({
+        // Banyak node (terutama Base public RPC) tidak mendukung argumen
+        // `true` pada newPendingTransactions — coba body-penuh dulu; kalau
+        // endpoint menolak (subscription error), fallback ke hash-only (sinyal
+        // Tx oleh karena itu tidak ter-decode, namun monitor tetap hidup dan
+        // flashblock logs (jalur utama) tetap jalan).
+
+        let req_full = json!({
             "id": 1u64,
             "jsonrpc": "2.0",
             "method": "eth_subscribe",
             "params": ["newPendingTransactions", true],
         });
-        match connect_and_subscribe(&ws_url, req).await {
+        let req_hash = json!({
+            "id": 1u64,
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["newPendingTransactions"],
+        });
+
+        let sub_result = match connect_and_subscribe(&ws_url, req_full).await {
+            Ok(ok) => Ok(ok),
+            Err(e) if e.to_string().contains("subscription error") => {
+                warn!(?e, "mempool body-penuh ditolak — fallback ke hash-only");
+                connect_and_subscribe(&ws_url, req_hash).await
+            }
+            Err(e) => Err(e),
+        };
+
+        match sub_result {
             Ok((mut ws, sub_id)) => {
                 info!(?sub_id, "mempool full-tx connected");
                 backoff = Duration::from_millis(500);
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, SubscriptionKind::MempoolTxs, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::MempoolTxs, &addresses, &selectors, &tx).await {
                                 warn!(?e, "mempool message handling failed");
                             }
                         }

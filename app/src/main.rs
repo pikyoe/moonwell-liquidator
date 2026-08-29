@@ -293,42 +293,33 @@ async fn main() -> Result<()> {
                     continue;
                 }
             }
-            // Likuidasi kompetitor (lewat mempool) SELALU diproses — bahkan
-            // untuk borrower yang belum dikenal state: kompetisi menandakan posisi
-            // yang relevan sedang terjadi sekarang, dan refresh+scan perlu
-            // dilakukan secepatnya..
+            // Sinyal yang membawa borrower specifik (mempool likuidasi,
+            // flashblock Borrow/LiquidateBorrow/OEV) untuk akun yang BELUM
+            // dikenal state — refresh posisinya dulu agar scan cepat benar-benar
+            // mengevaluasinya. Sinyal lain(Activity, Mint/Redeem/Transfer)
+            // tidak membawa borrower → scan global terhadap state yang ada.
 
-            if !sig.is_competitor_liquidation() {
-                if let Some(b) = sig.borrower() {
-                    if state_fast.borrowers.get(&b).is_none() {
-                        tracing::debug!(sig = ?sig, "sinyal akun tak dikenal — di-skip");
-                        continue;
-                    }
-                }
-            }
+            // Kandidat baru (mempool likuidasi maupun flashblock Borrow/OEV) yang
+            // belum dikenal state — refresh posisinya dulu agar scan cepat benar-benar
+            // mengevaluasinya.
 
-            // Kandidat kompetitor yang belum dikenal state — refresh posisinya dulu
-            // (snapshot per market) agar scan cepat benar-benar mengevaluasinya.
-
-            if sig.is_competitor_liquidation() {
-                if let Some(b) = sig.borrower() {
-                    if state_fast.borrowers.get(&b).is_none() {
-                        info!(?b, "kandidat kompetitor baru — refresh posisi sebelum scan cepat");
-                        for m in &markets_fast {
-                            match IMToken::new(*m, &http_fast).getAccountSnapshot(b).call().await {
-                                Ok(s) => {
-                                    state_fast.upsert_or_remove(
-                                        b,
-                                        *m,
-                                        Position {
-                                            mtoken_balance: s.mTokenBalance,
-                                            borrow_balance: s.borrowBalance,
-                                            exchange_rate: s.exchangeRateMantissa,
-                                        },
-                                    );
-                                }
-                                Err(e) => warn!(?e, ?m, ?b, "refresh kandidat kompetitor gagal"),
+            if let Some(b) = sig.borrower() {
+                if state_fast.borrowers.get(&b).is_none() {
+                    info!(?b, "kandidat baru (sinyal cepat) — refresh posisi sebelum scan cepat");
+                    for m in &markets_fast {
+                        match IMToken::new(*m, &http_fast).getAccountSnapshot(b).call().await {
+                            Ok(s) => {
+                                state_fast.upsert_or_remove(
+                                    b,
+                                    *m,
+                                    Position {
+                                        mtoken_balance: s.mTokenBalance,
+                                        borrow_balance: s.borrowBalance,
+                                        exchange_rate: s.exchangeRateMantissa,
+                                    },
+                                );
                             }
+                            Err(e) => warn!(?e, ?m, ?b, "refresh kandidat gagal"),
                         }
                     }
                 }
