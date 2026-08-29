@@ -323,6 +323,7 @@ async fn main() -> Result<()> {
             if !oev_trigger {
                 let strategy = strategy.clone();
                 let http = http.clone();
+                let cfg = cfg.clone();
                 let refresh_gate = refresh_gate.clone();
                 tasks.spawn(async move {
                     let permit = match refresh_gate.try_acquire_owned() {
