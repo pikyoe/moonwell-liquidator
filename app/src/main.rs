@@ -247,6 +247,10 @@ async fn main() -> Result<()> {
         // punya permit sendiri sehingga TIDAK menunggu scan blok reguler
         // (dan tidak memperebutkan permit yang sama).
         let oev_scan_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        // Gate terpisah untuk sweep marginal-borrower: try-acquire mencegah
+        // task sweep menumpuk (pile-up) bila satu sweep sebelumnya belum
+        // selesai saat interval berikutnya tiba (RPC accrue-fresh lambat).
+        let sweep_gate = Arc::new(tokio::sync::Semaphore::new(1));
 
 
         while let Some(block) = stream.next().await {
@@ -347,7 +351,15 @@ async fn main() -> Result<()> {
                 let http_sweep = http.clone();
                 let cfg_sweep = cfg.clone();
                 let threshold = cfg.sweep_hf_threshold_scaled;
+                let gate = sweep_gate.clone();
                 tasks.spawn(async move {
+                    // Skip bila sweep sebelumnya belum selesai — mencegah
+                    // pile-up task sweep saat RPC accrue-fresh lambat; interval
+                    // berikutnya akan mencoba lagi dengan state yang lebih segar.
+                    let permit = match gate.try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     // Refresh harga + ambil snapshot markets DI DALAM task agar loop
                     // blok tidak menunggu I/O RPC sweep (dan sweep memakai harga
                     // terkini dari strategy, bukan map startup yang beku).
@@ -358,6 +370,7 @@ async fn main() -> Result<()> {
                     if let Err(e) = indexer_sweep.sweep_marginal_borrowers(markets_fresh, threshold).await {
                         warn!(?e, "sweep akun marginal gagal");
                     }
+                    drop(permit);
                 });
             }
 
