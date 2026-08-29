@@ -1,69 +1,102 @@
+# Moonwell Liquidator - contoh konfigurasi AKTIF. Salin ke config.toml, lalu isi yang wajib.
+#
+# Yang WAJIB diisi sendiri:
+#   - base_rpc_ws          (endpoint WebSocket RPC Anda)
+#   - hypersync_token     (token dashboard Envio, ATAU set env ENVIO_API_TOKEN dan
+#                           hapus baris ini agar default dari env dipakai)
+#   - private_key          (kunci signer bot)
+#   - executor_address     (alamat kontrak OevLiquidator hasil deploy)
+# Sisanya sudah diisi nilai produksi yang benar dan AKTIF.
+
 base_rpc_http = "https://mainnet.base.org"
 base_rpc_ws   = "wss://YOUR_RPC_WS"
 
-# Envio HyperSync — satu-satunya sumber event log bot.
-# RPC free-tier (Alchemy/QuickNode/Chainstack/Dwellir) memblokir `eth_getLogs`
+# Envio HyperSync - satu-satunya sumber event log bot.
+# RPC free-tier (Alchemy/QuickNode/Chainstack/Dwellir) memblokir eth_getLogs,
 # sehingga pembacaan event Borrow/Mint/Repay/Transfer/Liquidate TIDAK bisa
 # lewat RPC biasa. HyperSync adalah query layer yang menuai log tanpa
 # menggunakan eth_getLogs. eth_call dan health-check TETAP memakai base_rpc_http.
 # Daftar endpoint: https://docs.envio.dev/docs/hypersync/overview
 hypersync_url   = "https://base.hypersync.xyz"
-# API token dari dashboard Envio (opsional untuk endpoint publik; wajib untuk
-# kuota lebih besar/private). Dapat juga diisi via env ENVIO_API_TOKEN.
-hypersync_token = ""
-# Whitelist alamat ChainlinkOEVWrapper untuk trigger scan OEV. Bot memantau
-# event `PriceUpdatedEarlyAndLiquidated` (bukan UpdatedPrices — itu tidak
-# dipancarkan). Bila kosong, trigger OEV nonaktif (scan tetap jalan per blok).
-# Wrapper WETH Base: 0x57DA741aD933869cC9EBfb9668288053A0738f3c
-# oev_wrappers = ["0x57DA741aD933869cC9EBfb9668288053A0738f3c"]
-# opsional: endpoint Flashblocks Base MAINNET (bukan sepolia) untuk preconf 200ms.
-# Semua public endpoint Base sudah Flashblocks-enabled (docs.base.org); contoh:
-#   https://mainnet.flashblocks.base.org
-# Gunakan endpoint provider privat (Alchemy/QuickNode/Chainstack) bila ingin
-# jalur submit privat - tx via mempool publik tetap front-runnable.
-# flashblocks_endpoint = "https://mainnet.flashblocks.base.org"
-private_key   = "0x..."
+# Token WAJIB diisi sejak Nov    2025 (bot menolak start bila kosong.Cara isi:
+#   a. isi langsung di sini, atau
+#   b.hapus baris `hypersync_token` ini dan set env ENVIO_API_TOKEN (default serde)
+hypersync_token = "ISI_TOKEN_ENVIO"
+
+# Whitelist alamat ChainlinkOEVWrapper untuk trigger scan OEV - AKTIF.
+# Bot memantau event `PriceUpdatedEarlyAndLiquidated` (bukan UpdatedPrices - itu
+# tidak dipancarkan). Daftar ini ditambah hasil resolve dinamis via
+# `oracle.getFeed(symbol)` saat startup. Wrapper WETH Base (terverifikasi):
+oev_wrappers = ["0x57DA741aD933869cC9EBfb9668288053A0738f3c"]
+
+# Endpoint Flashblocks Base MAINNET untuk submit preconf cepat (+200ms) - AKTIF.
+# Semua public endpoint Base sudah Flashblocks-enabled(docs.base.org). Bila ingin
+# jalur submit privat(anti front-run di mempool publik), ganti dengan endpoint
+# provider privat(Alchemy/QuickNode/Chainstack) yang mendukung Flashblocks.
+flashblocks_endpoint = "https://mainnet.flashblocks.base.org"
+
+# ---- WAJIB DIISI ----
+private_key    = "0x..."
 executor_address = "0x..."
 
 # batas posisi per likuidasi, USD
 max_position_usd = 25000
+
 # minimum profit dalam wei TOKEN HASIL AKHIR (loan token bila swap aktif,
 # kolateral bila tidak). Fallback bila simbol tidak ada di map di bawah.
-# PERINGATAN: "0" berarti bot mengirim likuidasi berprofit nol — isi nilai
-# masuk akal, idealnya via [min_profit_per_symbol] di bawah.
-min_profit_wei = "0"
+# PERINGATAN: "0" berarti bot mengirim likuidasi berprofit nol.
+# Semua market aktif sudah dicakup [min_profit_per_symbol] di bawah.
+min_profit_wei = "300000"
+# Override per simbol - AKTIF. Penting karena desimal beda(WETH 18,
+# USDC 6, cbBTC 8) dan nilai wei yang aman per token.
+min_profit_per_symbol = { WETH = "1000000000000000", USDC = "300000", cbBTC = "500", wstETH = "100000000000000", rETH = "100000000000000", weETH = "100000000000000", AERO = "500000000000000000", EURC = "300000", USDS = "300000000000000000", DAI = "300000000000000000" }
 
 # batas biaya gas per transaksi dalam wei ETH (default 0.0005 ETH).
-# Tx dengan estimasi gas cost di atas ini di-skip — melindungi dari
+# Tx dengan estimasi gas cost di atas ini di-skip - melindungi dari
 # min_profit salah konfigurasi atau gas spike.
 max_gas_cost_wei = "500000000000000"
-# Priority fee (tip) dalam GWEI agar tx bersaing di mempool Base. 0 = pakai
-# rekomendasi node. Set mis. 0.2 (0.2 gwei) untuk likuidasi yang lebih agresif.
-priority_fee_gwei = 0
-# Override per simbol — penting karena desimal beda (WETH 18, USDC 6, cbBTC 8).
-# [min_profit_per_symbol]
-# WETH = "1000000000000000"   # 0.001 ETH
-# USDC = "300000"             # 0.30 USDC
-# fallback jalur B
+
+# Priority fee(tip) dalam GWEI integer agar tx bersaing di mempool Base.
+# 0 = pakai rekomendasi node(eth_maxPriorityFeePerGas. Untuk likuidasi
+# yang agresif set >=1 gwei.
+priority_fee_gwei = 1
+
+# fallback jalur B (classic liquidateBorrow) bila simulasi OEV revert.
 classic_fallback = true
 
-# Interval blok untuk sweep akun marginal-safe (staleness bunga). `getAccountSnapshot`
-# view TIDAK memicu accrueInterest(), jadi borrower yang HF cached-nya "safe tipis"
+# Mode kering(dry-run): semua simulasi/estimasi dijalankan tapi tx TIDAK
+# dikirim. Untuk uji coba aman set true.
+dry_run = false
+
+# Konkurensi scan & refresh - sesuaikan dengan limit provider RPC.
+# eval_concurrency          = jumlah evaluasi borrower paralel per scan.
+# indexer_refresh_concurrency = jumlah refresh snapshot akun per blok.
+# submitter_concurrency     = jumlah worker simulate+send. Set 1 bila ingin
+# mengirim tx sepenuhnya serialikin(hindari isu nonce).
+eval_concurrency = 8
+indexer_refresh_concurrency = 8
+submitter_concurrency = 4
+
+# Kedalaman blok bootstrap borrower historis. 0 = bootstrap dari blok genesis
+#(mahal. Nilai kecil(mis. 2000) cukup untuk menangkap posisi underwater
+# yang masih hidup di non-archive RPC; bot meneruskan live setelah bootstrap.
+bootstrap_depth_blocks = 2000
+
+# Interval blok untuk sweep akun marginal-safe(staleness bunga(. getAccountSnapshot
+# view TIDAK memicu accrueInterest(), jadi borrower yang HF cached-nya"safe tipis"
 # bisa sudah underwater secara matematis tapi tidak kelihatan sampai ada event refresh.
 # Sweep meng-accrue tiap market + snapshot semua kandidat dalam SATU batch
-# Multicall3 (eth_call simulasi, bukan tx asli). 0 = nonaktif.
-
+# Multicall3(eth_call simulasi, bukan tx asli). 0 = nonaktif.
 sweep_interval_blocks = 25
 # Ambang HF (skala 1e18) untuk sweep: akun dengan cached HF di bawah ambang
-# (tapi >= 1) disegarkan paksa. Default 1.05e18.
-
-sweep_hf_threshold_scaled ="1050000000000000000"
+#(tapi >=1, tidak liquidatable) disegarkan paksa lewat accrue-fresh.
+sweep_hf_threshold_scaled = "1050000000000000000"
 
 [swap]
 enabled = true
-router  = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"  # Aerodrome Router (Base)
-slippage_bps = 200          # 2% slippage guard
-liquidator_fee_bps = 3000   # 30% bagian liquidator di jalur OEV
+router   = "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"  # Aerodrome Router (Base)
+slippage_bps = 200            # 2% slippage guard
+liquidator_fee_bps = 3000    # 30% bagian liquidator di jalur OEV
 
 # Moonwell Base mTokens (diverifikasi dari docs Moonwell)
 [[markets]]
