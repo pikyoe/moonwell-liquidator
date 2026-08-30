@@ -38,12 +38,6 @@ pub enum FastSignal {
         address: Address,
         topic0: B256,
         tx_hash: B256,
-        /// Borrower yang diekstrak dari event Borrow/LiquidateBorrow/
-        /// PriceUpdatedEarlyAndLiquidated (None untuk Mint/Redeem/Transfer).
-        /// Dipakai main.rs agar sinyal preconfirmation akun BARU (belum ada
-        /// di state) tetap bisa di-refresh + di-scan secepatnya.
-
-        borrower: Option<Address>,
     },
     Tx {
         from: Address,
@@ -68,7 +62,6 @@ impl FastSignal {
     }
     pub fn borrower(&self) -> Option<Address> {
         match self {
-            FastSignal::Log { borrower: Some(b), .. } => Some(*b),
             FastSignal::Tx {
                 intent: Some(TxIntent::Liquidation { borrower, .. }),
                 ..
@@ -83,12 +76,12 @@ impl FastSignal {
 }
 
 alloy::sol! {
-    event Mint(address indexed minter, uint256 mintAmount, uint256 mintTokens);
-    event Redeem(address indexed redeemer, uint256 redeemAmount, uint256 redeemTokens);
-    event Borrow(address indexed borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
-    event RepayBorrow(address indexed payer, address indexed borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event Mint(address minter, uint256 mintAmount, uint256 mintTokens);
+    event Redeem(address redeemer, uint256 redeemAmount, uint256 redeemTokens);
+    event Borrow(address borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
     event Transfer(address indexed from, address indexed to, uint256 amount);
-    event LiquidateBorrow(address indexed liquidator, address indexed borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
+    event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
     event PriceUpdatedEarlyAndLiquidated(
         address indexed borrower,
         uint256 repayAmount,
@@ -99,7 +92,7 @@ alloy::sol! {
     );
     function borrow(uint256);
     function redeem(uint256);
-    function repayBorrow(address) returns (uint256);
+    function repayBorrow(uint256);
     function liquidateBorrow(address borrower, uint256 repayAmount, address mTokenCollateral) returns ((uint256,uint256));
     function transfer(address, uint256) returns (bool);
     function updatePriceEarlyAndLiquidate(address borrower, uint256 repayAmount, address mTokenCollateral, address mTokenLoan);
@@ -190,21 +183,6 @@ async fn handle_message(
         SubscriptionKind::FlashblocksLogs => {
             match serde_json::from_value::<Log>(result.clone()) {
                 Ok(log) => {
-                    // Ekstrak borrower untuk event yang menyangkut posisi pinjam;
-                    // sinyal preconfirmation akun baru (belum ada di state) tetap bisa
-                    // di-refresh + di-scan cepat oleh penerima (lihat main.rs).
-
-                    let borrower = {
-                        if let Ok(ev) = Borrow::decode_log(&log.inner) {
-                            Some(ev.borrower)
-                        } else if let Ok(ev) = LiquidateBorrow::decode_log(&log.inner) {
-                            Some(ev.borrower)
-                        } else if let Ok(ev) = PriceUpdatedEarlyAndLiquidated::decode_log(&log.inner) {
-                            Some(ev.borrower)
-                        } else {
-                            None
-                        }
-                    };
                     let t0 = log.topics().first().copied();
                     if let Some(t0) = t0 {
                         if watch_topics().contains(&t0) {
@@ -212,7 +190,6 @@ async fn handle_message(
                                 address: log.address(),
                                 topic0: t0,
                                 tx_hash: log.transaction_hash.unwrap_or_default(),
-                                borrower,
                             });
                         }
                     }

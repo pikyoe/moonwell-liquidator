@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::contracts::{IChainlinkOEVWrapper, IComptroller, IMToken, IOevLiquidator, IOracle, LiquidationJob, Mode, COMPTROLLER};
 use crate::health::MarketInfo;
 use crate::indexer::Indexer;
-use crate::state::{AccountState, Position, SharedState};
+use crate::state::{AccountState, SharedState};
 use crate::strategy::Strategy;
 use crate::submitter::Submitter;
 use crate::flashblocks::{run_flashblocks_monitor, run_mempool_monitor, FastSignal};
@@ -277,7 +277,6 @@ async fn main() -> Result<()> {
     let strategy_fast = strategy.clone();
     let http_fast = http.clone();
     let cfg_fast = cfg.clone();
-    let markets_fast = cfg_fast.market_addresses()?;
     let job_tx_fast = job_tx.clone();
     let state_fast = state.clone();
     tokio::spawn(async move {
@@ -293,35 +292,17 @@ async fn main() -> Result<()> {
                     continue;
                 }
             }
-            // Sinyal yang membawa borrower specifik (mempool likuidasi,
-            // flashblock Borrow/LiquidateBorrow/OEV) untuk akun yang BELUM
-            // dikenal state — refresh posisinya dulu agar scan cepat benar-benar
-            // mengevaluasinya. Sinyal lain(Activity, Mint/Redeem/Transfer)
-            // tidak membawa borrower → scan global terhadap state yang ada.
-
-            // Kandidat baru (mempool likuidasi maupun flashblock Borrow/OEV) yang
-            // belum dikenal state — refresh posisinya dulu agar scan cepat benar-benar
-            // mengevaluasinya.
+            // Sinyal yang membawa borrower specifik (likuidasi kompetitor) untuk
+            // akun yang BELUM dikenal state di-skip — posisi on-chain-nya belum
+            // terbaca (pra-blok final tidak tersedia di RPC canonical), jadi
+            // refresh sekarang sia-sia dan hanya membuang RPC. Akun baru akan
+            // tertangkap & di-refresh oleh indexer blok canonical (`watch_block`)
+            // di blok berikutnya.
 
             if let Some(b) = sig.borrower() {
                 if state_fast.borrowers.get(&b).is_none() {
-                    info!(?b, "kandidat baru (sinyal cepat) — refresh posisi sebelum scan cepat");
-                    for m in &markets_fast {
-                        match IMToken::new(*m, &http_fast).getAccountSnapshot(b).call().await {
-                            Ok(s) => {
-                                state_fast.upsert_or_remove(
-                                    b,
-                                    *m,
-                                    Position {
-                                        mtoken_balance: s.mTokenBalance,
-                                        borrow_balance: s.borrowBalance,
-                                        exchange_rate: s.exchangeRateMantissa,
-                                    },
-                                );
-                            }
-                            Err(e) => warn!(?e, ?m, ?b, "refresh kandidat gagal"),
-                        }
-                    }
+                    tracing::debug!(sig = ?sig, "sinyal akun tak dikenal — di-skip");
+                    continue;
                 }
             }
 
