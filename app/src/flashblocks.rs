@@ -34,32 +34,14 @@ pub enum TxIntent {
 
 #[derive(Debug, Clone)]
 pub enum FastSignal {
-    Log {
-        address: Address,
-        topic0: B256,
-        tx_hash: B256,
-    },
+    Log,
     Tx {
         from: Address,
-        to: Option<Address>,
-        input: Vec<u8>,
         intent: Option<TxIntent>,
     },
 }
 
 impl FastSignal {
-    pub fn topic0(&self) -> Option<B256> {
-        match self {
-            FastSignal::Log { topic0, .. } => Some(*topic0),
-            FastSignal::Tx { .. } => None,
-        }
-    }
-    pub fn kind(&self) -> &'static str {
-        match self {
-            FastSignal::Log { .. } => "flashblock-log",
-            FastSignal::Tx { .. } => "mempool-tx",
-        }
-    }
     pub fn borrower(&self) -> Option<Address> {
         match self {
             FastSignal::Tx {
@@ -186,11 +168,7 @@ async fn handle_message(
                     let t0 = log.topics().first().copied();
                     if let Some(t0) = t0 {
                         if watch_topics().contains(&t0) {
-                            let _ = tx.send(FastSignal::Log {
-                                address: log.address(),
-                                topic0: t0,
-                                tx_hash: log.transaction_hash.unwrap_or_default(),
-                            });
+                            let _ = tx.send(FastSignal::Log);
                         }
                     }
                 }
@@ -218,8 +196,6 @@ async fn handle_message(
                         let intent = decode_intent(t.from(), &input);
                         let _ = tx.send(FastSignal::Tx {
                             from: t.from(),
-                            to: t.to(),
-                            input,
                             intent,
                         });
                     }
