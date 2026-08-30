@@ -73,30 +73,15 @@ impl FastSignal {
             _ => None,
         }
     }
-    pub fn is_competitor_liquidation(&self) -> bool {
-        matches!(
-            self,
-            FastSignal::Tx {
-                intent: Some(TxIntent::Liquidation { .. }),
-                ..
-            }
-        ) || matches!(
-            self,
-            FastSignal::Tx {
-                intent: Some(TxIntent::OevLiquidation { .. }),
-                ..
-            }
-        )
-    }
 }
 
 alloy::sol! {
-    event Mint(address indexed minter, uint256 mintAmount, uint256 mintTokens);
-    event Redeem(address indexed redeemer, uint256 redeemAmount, uint256 redeemTokens);
-    event Borrow(address indexed borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
-    event RepayBorrow(address indexed payer, address indexed borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event Mint(address minter, uint256 mintAmount, uint256 mintTokens);
+    event Redeem(address redeemer, uint256 redeemAmount, uint256 redeemTokens);
+    event Borrow(address borrower, uint256 borrowAmount, uint256 accountBorrows, uint256 totalBorrows);
+    event RepayBorrow(address payer, address borrower, uint256 repayAmount, uint256 accountBorrows, uint256 totalBorrows);
     event Transfer(address indexed from, address indexed to, uint256 amount);
-    event LiquidateBorrow(address indexed liquidator, address indexed borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
+    event LiquidateBorrow(address liquidator, address borrower, uint256 repayAmount, address mTokenCollateral, uint256 seizeTokens);
     event PriceUpdatedEarlyAndLiquidated(
         address indexed borrower,
         uint256 repayAmount,
@@ -107,7 +92,7 @@ alloy::sol! {
     );
     function borrow(uint256);
     function redeem(uint256);
-    function repayBorrow(address) returns (uint256);
+    function repayBorrow(uint256);
     function liquidateBorrow(address borrower, uint256 repayAmount, address mTokenCollateral) returns ((uint256,uint256));
     function transfer(address, uint256) returns (bool);
     function updatePriceEarlyAndLiquidate(address borrower, uint256 repayAmount, address mTokenCollateral, address mTokenLoan);
@@ -186,6 +171,7 @@ async fn handle_message(
     text: &str,
     kind: SubscriptionKind,
     addresses: &[Address],
+    selectors: &[[u8; 4]],
     tx: &tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let v: Value = serde_json::from_str(text)?;
@@ -212,10 +198,23 @@ async fn handle_message(
             }
         }
         SubscriptionKind::MempoolTxs => {
+            // Provider tertentu (mis. Base public RPC) mengabaikan argumen
+            // `true` dan tetap mengirim hash alih-alih objek penuh — terima
+            // tenang dan lewati (tanpa body, intent tidak bisa di-decode).
+            if result.is_string() {
+                return Ok(());
+            }
             match serde_json::from_value::<Transaction>(result.clone()) {
                 Ok(t) => {
                     if filter_tx(&t, addresses) {
                         let input = t.input().to_vec();
+                        // Hanya tx yang memanggil fungsi yang diawasi (borrow/redeem/
+                        // repay/transfer/liquidateBorrow/updatePriceEarlyAndLiquidate)
+                        // yang diteruskan; panggilan acak lain ke kontrak kita
+                        // (approve/mint/dll) tidak boleh memicu refresh+scan.
+                        if input.len() < 4 || !selectors.iter().any(|s| *s == input[..4]) {
+                            return Ok(());
+                        }
                         let intent = decode_intent(t.from(), &input);
                         let _ = tx.send(FastSignal::Tx {
                             from: t.from(),
@@ -264,7 +263,7 @@ async fn connect_and_subscribe(url: &str, req: Value) -> Result<(WsStream, Value
 pub async fn run_flashblocks_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    _selectors: Vec<[u8; 4]>,
+    selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let topics: Vec<B256> = watch_topics();
@@ -289,7 +288,7 @@ pub async fn run_flashblocks_monitor(
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, SubscriptionKind::FlashblocksLogs, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::FlashblocksLogs, &addresses, &selectors, &tx).await {
                                 warn!(?e, "flashblocks message handling failed");
                             }
                         }
@@ -319,25 +318,47 @@ pub async fn run_flashblocks_monitor(
 pub async fn run_mempool_monitor(
     ws_url: String,
     addresses: Vec<Address>,
-    _selectors: Vec<[u8; 4]>,
+    selectors: Vec<[u8; 4]>,
     tx: tokio::sync::mpsc::UnboundedSender<FastSignal>,
 ) -> Result<()> {
     let mut backoff = Duration::from_millis(500);
     loop {
-        let req = json!({
+        // Banyak node (terutama Base public RPC) tidak mendukung argumen
+        // `true` pada newPendingTransactions — coba body-penuh dulu; kalau
+        // endpoint menolak (subscription error), fallback ke hash-only (sinyal
+        // Tx oleh karena itu tidak ter-decode, namun monitor tetap hidup dan
+        // flashblock logs (jalur utama) tetap jalan).
+
+        let req_full = json!({
             "id": 1u64,
             "jsonrpc": "2.0",
             "method": "eth_subscribe",
             "params": ["newPendingTransactions", true],
         });
-        match connect_and_subscribe(&ws_url, req).await {
+        let req_hash = json!({
+            "id": 1u64,
+            "jsonrpc": "2.0",
+            "method": "eth_subscribe",
+            "params": ["newPendingTransactions"],
+        });
+
+        let sub_result = match connect_and_subscribe(&ws_url, req_full).await {
+            Ok(ok) => Ok(ok),
+            Err(e) if e.to_string().contains("subscription error") => {
+                warn!(?e, "mempool body-penuh ditolak — fallback ke hash-only");
+                connect_and_subscribe(&ws_url, req_hash).await
+            }
+            Err(e) => Err(e),
+        };
+
+        match sub_result {
             Ok((mut ws, sub_id)) => {
                 info!(?sub_id, "mempool full-tx connected");
                 backoff = Duration::from_millis(500);
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Text(t)) => {
-                            if let Err(e) = handle_message(&t, SubscriptionKind::MempoolTxs, &addresses, &tx).await {
+                            if let Err(e) = handle_message(&t, SubscriptionKind::MempoolTxs, &addresses, &selectors, &tx).await {
                                 warn!(?e, "mempool message handling failed");
                             }
                         }
