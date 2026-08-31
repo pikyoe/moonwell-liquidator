@@ -150,14 +150,32 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             }
         };
 
-        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+        // accrueInterest untuk SEMUA market yang dimasuki borrower (getAssetsIn),
+        // bukan hanya mloan+mcoll. getAccountLiquidity di bawah adalah view yang
+        // TIDAK meng-accrue — ia baca stored balance. Tanpa meng-accrue tiap
+        // market dulu, shortfall bisa di-understate untuk market lain (bunga
+        // tertunda tidak terlihat), sehingga posisi borderline bisa keliru
+        // di-skip padahal on-chain (setelah liquidateBorrow meng-accrue semua)
+        // sebenarnya liquidatable. Meng-accrue seluruh `enabled` membuat
+        // getAccountLiquidity koheren dengan yang dievaluasi executor.
+        let mut accrue_markets: Vec<Address> = enabled.to_vec();
         for &market in &[mloan, mcoll] {
+            if !accrue_markets.contains(&market) {
+                accrue_markets.push(market);
+            }
+        }
+        let mut calls: Vec<IMulticall3::Call3> = Vec::new();
+        for &market in &accrue_markets {
             calls.push(IMulticall3::Call3 {
                 target: market,
                 allowFailure: true,
                 callData: IMToken::accrueInterestCall { }.abi_encode().into(),
             });
         }
+        // getAccountSnapshot untuk mloan+mcoll saja — hanya keduanya yang
+        // dipakai untuk membangun job (borrow_bal/coll_bal). Indeks snapshot
+        // dimulai setelah semua call accrueInterest.
+        let snapshot_base = accrue_markets.len();
         for &market in &[mloan, mcoll] {
             calls.push(IMulticall3::Call3 {
                 target: market,
@@ -165,23 +183,30 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                 callData: IMToken::getAccountSnapshotCall { account: borrower }.abi_encode().into(),
             });
         }
-        // getAccountLiquidity digabung ke batch yang sama agar re-check
-        // kelayakan tidak menambah round-trip RPC. Ini di-eval pada blok yang
-        // SAMA dengan accrue+snapshot di atas, jadi koheren.
+        // getAccountLiquidity HARUS jadi call terakhir agar seluruh accrueInterest
+        // di atas sudah tereksekusi dalam frame aggregate3 yang sama sebelum ia
+        // membaca stored balance. Digabung ke batch agar tanpa round-trip ekstra.
+        let liquidity_idx = calls.len();
         calls.push(IMulticall3::Call3 {
             target: COMPTROLLER,
             allowFailure: true,
             callData: IComptroller::getAccountLiquidityCall { account: borrower }.abi_encode().into(),
         });
+        let expected_len = liquidity_idx + 1;
         let mcall = IMulticall3::new(MULTICALL3, &self.provider);
         let res = mcall.aggregate3(calls).call().await?;
-        if res.len() != 5 {
-            warn!(?borrower, got = res.len(), "refresk kandidat multicall tidak lengkap — skip");
+        if res.len() != expected_len {
+            warn!(?borrower, got = res.len(), want = expected_len, "refresk kandidat multicall tidak lengkap — skip");
             return Ok(None);
         }
         for (i, market)in [mloan, mcoll].into_iter().enumerate() {
-            let acc = &res[i];
-            let r = &res[2 + i];
+            // Cari indeks accrueInterest market ini di dalam accrue_markets.
+            let Some(acc_idx) = accrue_markets.iter().position(|m| *m == market) else {
+                warn!(?borrower, ?market, "market kandidat tidak ada di accrue set — skip");
+                return Ok(None);
+            };
+            let acc = &res[acc_idx];
+            let r = &res[snapshot_base + i];
             let accrue_ok = acc.success
                 && IMToken::accrueInterestCall::abi_decode_returns(&acc.returnData)
                     .map(|r| r == U256::ZERO)
@@ -217,18 +242,20 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
         }
 
         // Re-check kelayakan pakai SUMBER KEBENARAN on-chain: Comptroller
-        // getAccountLiquidity (res[4], digabung ke multicall di atas). HF awal
-        // pake data stale cache; antara cache dan eth_call simulasi posisi bisa
-        // berubah (interest accrual, borrower deposit/repay, oracle price
-        // update). Menghitung HF lokal dari state yang di-refresh sebagian
-        // (hanya mloan+mcoll) + harga cache TIDAK koheren — market lain & harga
-        // oracle masih basi. getAccountLiquidity memakai
-        // getAccountLiquidityInternal yang PERSIS dievaluasi executor: ia
-        // meng-accrue semua market & memakai harga oracle terkini pada blok
-        // yang sama. shortfall == 0 => posisi tidak underwater => executor akan
-        // revert INSUFFICIENT_SHORTFALL, jadi skip di sini hemat simulasi.
+        // getAccountLiquidity (call terakhir batch, indeks liquidity_idx). HF
+        // awal pake data stale cache; antara cache dan eth_call simulasi posisi
+        // bisa berubah (interest accrual, borrower deposit/repay, oracle price
+        // update). Menghitung HF lokal dari state yang di-refresh sebagian +
+        // harga cache TIDAK koheren — market lain & harga oracle masih basi.
+        // getAccountLiquidity adalah view (baca stored balance, TIDAK
+        // meng-accrue sendiri), tapi seluruh market borrower sudah di-accrue
+        // oleh call accrueInterest di atas dalam frame aggregate3 yang sama —
+        // jadi stored balance yang dibacanya sudah terakru & harga oracle
+        // terkini pada blok yang sama, koheren dengan getAccountLiquidityInternal
+        // yang dievaluasi executor. shortfall == 0 => posisi tidak underwater
+        // => executor akan revert INSUFFICIENT_SHORTFALL, jadi skip hemat simulasi.
         {
-            let liq = &res[4];
+            let liq = &res[liquidity_idx];
             if !liq.success {
                 warn!(?borrower, "getAccountLiquidity gagal di multicall — skip");
                 return Ok(None);
