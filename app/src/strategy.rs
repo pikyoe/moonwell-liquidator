@@ -210,10 +210,12 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
 
         // Re-check HF dengan data SEGAR setelah accrueInterest + snapshot
         // refresh. HF awal pake data stale cache; antara cache dan eth_call
-        // simulasi, posisi bisa berubah (oracle update, interest accrual,
-        // borrower deposit/repay). Tanpa re-check ini, bot terus kirim job
-        // yang revert "liquidate failed" (INSUFFICIENT_SHORTFALL) karena
-        // on-chain getAccountLiquidityInternal melihat shortfall == 0.
+        // simulasi, posisi bisa berubah (interest accrual, borrower
+        // deposit/repay). Tanpa re-check ini, bot terus kirim job yang revert
+        // "liquidate failed" (INSUFFICIENT_SHORTFALL) karena on-chain
+        // getAccountLiquidityInternal melihat shortfall == 0.
+        // NOTE: oracle prices tetap dari cache; kalau oracle-driven stale
+        // reverts signifikan, refresh harga via getFeed sebelum re-check HF.
         {
             let Some(pos) = snap.state.positions.get(&borrower) else { return Ok(None) };
             let mut fresh_tuples = Vec::new();
