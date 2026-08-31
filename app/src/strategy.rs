@@ -208,6 +208,26 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             return Ok(None);
         }
 
+        // Re-check HF dengan data SEGAR setelah accrueInterest + snapshot
+        // refresh. HF awal pake data stale cache; antara cache dan eth_call
+        // simulasi, posisi bisa berubah (oracle update, interest accrual,
+        // borrower deposit/repay). Tanpa re-check ini, bot terus kirim job
+        // yang revert "liquidate failed" (INSUFFICIENT_SHORTFALL) karena
+        // on-chain getAccountLiquidityInternal melihat shortfall == 0.
+        {
+            let Some(pos) = snap.state.positions.get(&borrower) else { return Ok(None) };
+            let mut fresh_tuples = Vec::new();
+            for m in pos.iter() {
+                fresh_tuples.push((*m.key(), m.mtoken_balance, m.borrow_balance, m.exchange_rate));
+            }
+            drop(pos);
+            let (_, _, fresh_hf) = health_factor(&fresh_tuples, &snap.markets);
+            if classify(fresh_hf) != Health::Liquidatable {
+                debug!(?borrower, fresh_hf = %fresh_hf, "posisi sudah tidak underwater setelah refresh — skip");
+                return Ok(None);
+            }
+        }
+
         if snap.close_factor.is_zero() {
             return Ok(None);
         }
