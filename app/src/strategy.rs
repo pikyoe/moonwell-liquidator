@@ -165,9 +165,17 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
                 callData: IMToken::getAccountSnapshotCall { account: borrower }.abi_encode().into(),
             });
         }
+        // getAccountLiquidity digabung ke batch yang sama agar re-check
+        // kelayakan tidak menambah round-trip RPC. Ini di-eval pada blok yang
+        // SAMA dengan accrue+snapshot di atas, jadi koheren.
+        calls.push(IMulticall3::Call3 {
+            target: COMPTROLLER,
+            allowFailure: true,
+            callData: IComptroller::getAccountLiquidityCall { account: borrower }.abi_encode().into(),
+        });
         let mcall = IMulticall3::new(MULTICALL3, &self.provider);
         let res = mcall.aggregate3(calls).call().await?;
-        if res.len() != 4 {
+        if res.len() != 5 {
             warn!(?borrower, got = res.len(), "refresk kandidat multicall tidak lengkap — skip");
             return Ok(None);
         }
@@ -208,25 +216,34 @@ impl<P: Provider + Clone + Send + Sync + 'static> ScanJob<P> {
             return Ok(None);
         }
 
-        // Re-check HF dengan data SEGAR setelah accrueInterest + snapshot
-        // refresh. HF awal pake data stale cache; antara cache dan eth_call
-        // simulasi, posisi bisa berubah (interest accrual, borrower
-        // deposit/repay). Tanpa re-check ini, bot terus kirim job yang revert
-        // "liquidate failed" (INSUFFICIENT_SHORTFALL) karena on-chain
-        // getAccountLiquidityInternal melihat shortfall == 0.
-        // NOTE: oracle prices tetap dari cache; kalau oracle-driven stale
-        // reverts signifikan, refresh harga via getFeed sebelum re-check HF.
+        // Re-check kelayakan pakai SUMBER KEBENARAN on-chain: Comptroller
+        // getAccountLiquidity (res[4], digabung ke multicall di atas). HF awal
+        // pake data stale cache; antara cache dan eth_call simulasi posisi bisa
+        // berubah (interest accrual, borrower deposit/repay, oracle price
+        // update). Menghitung HF lokal dari state yang di-refresh sebagian
+        // (hanya mloan+mcoll) + harga cache TIDAK koheren — market lain & harga
+        // oracle masih basi. getAccountLiquidity memakai
+        // getAccountLiquidityInternal yang PERSIS dievaluasi executor: ia
+        // meng-accrue semua market & memakai harga oracle terkini pada blok
+        // yang sama. shortfall == 0 => posisi tidak underwater => executor akan
+        // revert INSUFFICIENT_SHORTFALL, jadi skip di sini hemat simulasi.
         {
-            let Some(pos) = snap.state.positions.get(&borrower) else { return Ok(None) };
-            let mut fresh_tuples = Vec::new();
-            for m in pos.iter() {
-                fresh_tuples.push((*m.key(), m.mtoken_balance, m.borrow_balance, m.exchange_rate));
-            }
-            drop(pos);
-            let (_, _, fresh_hf) = health_factor(&fresh_tuples, &snap.markets);
-            if classify(fresh_hf) != Health::Liquidatable {
-                debug!(?borrower, fresh_hf = %fresh_hf, "posisi sudah tidak underwater setelah refresh — skip");
+            let liq = &res[4];
+            if !liq.success {
+                warn!(?borrower, "getAccountLiquidity gagal di multicall — skip");
                 return Ok(None);
+            }
+            match IComptroller::getAccountLiquidityCall::abi_decode_returns(&liq.returnData) {
+                Ok(r) => {
+                    if r.err != U256::ZERO || r.shortfall == U256::ZERO {
+                        debug!(?borrower, err = %r.err, shortfall = %r.shortfall, "getAccountLiquidity: tidak ada shortfall — skip");
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
+                    warn!(?borrower, ?e, "decode getAccountLiquidity gagal — skip");
+                    return Ok(None);
+                }
             }
         }
 
