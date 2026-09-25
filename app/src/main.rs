@@ -16,7 +16,7 @@ use crate::indexer::Indexer;
 use crate::state::{AccountState, SharedState};
 use crate::strategy::Strategy;
 use crate::submitter::Submitter;
-use crate::flashblocks::{run_flashblocks_monitor, run_mempool_monitor, FastSignal};
+use crate::flashblocks::{run_flashblocks_monitor, run_mempool_monitor, FastSignal, TxIntent};
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
@@ -279,10 +279,20 @@ async fn main() -> Result<()> {
     let cfg_fast = cfg.clone();
     let job_tx_fast = job_tx.clone();
     let state_fast = state.clone();
+    let indexer_fast = indexer.clone();
     tokio::spawn(async move {
         let mut last_scan = None::<Instant>;
         let debounce_ms = Duration::from_millis(cfg_fast.fast_signal_debounce_ms.max(1));
         let signer_addr_scan = signer_addr;
+        // Daftar market tetap (tidak perlu di-parse ulang per sinyal) untuk
+        // refresh posisi borrower tak dikenal yang dibawa sinyal likuidasi.
+
+        let all_markets: Vec<Address> = cfg_fast
+            .market_addresses()
+            .unwrap_or_else(|e| {
+                warn!(?e, "market_addresses gagal — refresh akun tak dikenal di-skip");
+                Vec::new()
+            });
         while let Some(sig) = fast_rx.recv().await {
             // Tx yang kita kirim sendiri (dari submitter public-RPC, non-private)
             // tidak perlu memicu scan ulang — skip cepat.
@@ -293,20 +303,45 @@ async fn main() -> Result<()> {
                 }
             }
             // Sinyal yang membawa borrower specifik (likuidasi kompetitor) untuk
-            // akun yang BELUM dikenal state di-skip — posisi on-chain-nya belum
-            // terbaca (pra-blok final tidak tersedia di RPC canonical), jadi
-            // refresh sekarang sia-sia dan hanya membuang RPC. Akun baru akan
-            // tertangkap & di-refresh oleh indexer blok canonical (`watch_block`)
-            // di blok berikutnya.
+            // akun yang BELUM dikenal state TIDAK di-skip bila sinyal itu likuidasi
+            // kompetitor — kita MAU bereaksi terhadap kejadian yang sudah terjadi walau
+            // posisi on-chain-nya belum sempat terbaca (pra-blok final tidak tersedia
+            // di RPC canonical). Refresh paksa dijalankan DI SINIagar scan cepat tidak
+            // bekerja dengan state kosong (refresh indeks per blok canonical tetap
+            // berjalan normal Di bawah).Sinyal aktivitas biasa (borrow/redeem/transfer)
+            // untuk akun tak dikenal tetap di-skip — ia akan tertangkap oleh indexer
+            // blok canonical di blok berikutnya dengan biaya RPC yang lebih rendah.
+
+
 
             if let Some(b) = sig.borrower() {
-                if state_fast.borrowers.get(&b).is_none() {
+                let known = state_fast.borrowers.get(&b).is_some();
+                let competitor_liquidation = matches!(
+                    &sig,
+                    FastSignal::Tx { intent: Some(TxIntent::Liquidation { .. }), .. }
+                        | FastSignal::Tx { intent: Some(TxIntent::OevLiquidation { .. }), .. }
+                );
+                if !known && !competitor_liquidation {
                     tracing::debug!(sig = ?sig, "sinyal akun tak dikenal — di-skip");
                     continue;
                 }
+                // Refresh posisi borrower yang belum dikenal DI SINI agar scan cepat
+                // tidak bekerja dengan state kosong.
+
+
+
+                if !known {
+                    for market in &all_markets {
+                        if let Err(e) = indexer_fast.refresh_account(*market, b).await {
+                            warn!(?e, ?market, ?b, "refresh akun tak dikenal (sinyal likuidasi) gagal");
+                        }
+                    }
+                }
             }
 
-            if let Some(t) = last_scan {
+
+
+if let Some(t) = last_scan {
                 if t.elapsed() < debounce_ms {
                     continue;
                 }
@@ -387,8 +422,15 @@ async fn main() -> Result<()> {
             if let Some(prev) = last_processed {
                 if number > prev + 1 {
                     let from = prev + 1;
-                    if let Err(e) = indexer.watch_block(from, number, &oev_wrappers).await {
-                        warn!(?e, from, number, "resync rentang gagal");
+                    // Rentang resync EKSLUSIF terhadap blok kini (`number`): blok tsb
+                    // langsung diproses oleh `watch_block(number, number)` di bawah
+                    // — memprosesnya dua kali hanya membuang kueri HyperSync + RPC.
+
+                    let to_excl = number.saturating_sub(1);
+                    if to_excl >= from {
+                        if let Err(e) = indexer.watch_block(from, to_excl, &oev_wrappers).await {
+                            warn!(?e, from, to_excl, "resync rentang gagal");
+                        }
                     }
                 }
             }
@@ -615,8 +657,28 @@ async fn refresh_prices<P: Provider + Clone>(
     let oracle = IOracle::new(oracle_addr, provider);
 
     // Muat close factor & liquidation incentive dari chain — jangan hardcode.
-    let close_factor = comptroller.closeFactorMantissa().call().await?;
-    let incentive = comptroller.liquidationIncentiveMantissa().call().await?;
+    // Bila RPC comptroller gagal sesaat, PERTAHANKAN nilai terakhir yang
+    // diketahui (fallback) alih-alih menulis 0 — nilai 0 membuat
+    // scan melewati SEMUA borrower sampai refresh berikutnya sukses (area
+    // buta sementara yang bisa dihindari dengan biaya satu panggilan ekstra).
+    let (close_factor, incentive) = {
+        let prev = strategy.lock().await.comptroller_params();
+        let cf = match comptroller.closeFactorMantissa().call().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(?e, "closeFactorMantissa gagal — pakai nilai terakhir");
+                prev.0
+            }
+        };
+        let inc = match comptroller.liquidationIncentiveMantissa().call().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(?e, "liquidationIncentiveMantissa gagal — pakai nilai terakhir");
+                prev.1
+            }
+        };
+        (cf, inc)
+    };
 
     // Ambil harga SEMUA market terlebih dahulu di luar kunci — network I/O boleh
     // lambat, sehingga mengambil mutex di dalam loop per-RPC akan men-stall scan.

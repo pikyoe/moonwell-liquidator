@@ -453,6 +453,11 @@ impl<P> Strategy<P> {
         self.liquidation_incentive = incentive;
     }
 
+    /// Nilai comptroller yang terakhir diketahui (untuk fallback saat refresh RPC gagal).
+    pub fn comptroller_params(&self) -> (U256, U256) {
+        (self.close_factor, self.liquidation_incentive)
+    }
+
     pub fn scan<P2>(&self, provider: P2) -> Arc<ScanJob<P2>>
     where
         P2: Provider + Clone + Send + Sync + 'static,

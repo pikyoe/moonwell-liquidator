@@ -34,6 +34,7 @@ oev_wrappers = [
     "0xf655eedede0cd9f7a3de5e8018909c429dcfbf9b",    # USDS
     "0x0eab3b9ae08b43077ad1aeb9820462faf99bcec8",    # DAI
     "0x3623c921bfd9d7e9d88e5cbb436b68be2c2bc0b7",    # AERO
+    "0x945ab3891d7963214833b4d51f54f068c8e6b55e",    # EURC
 ]
 
 # Endpoint Flashblocks Base MAINNET untuk submit preconf cepat (+200ms) - AKTIF.
